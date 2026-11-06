@@ -1,8 +1,6 @@
 # lumen
 
-原生 Windows 亮度控制。Win32 + GDI+，单个 399 KB 的 exe，无 WebView、无第三方运行时。
-
-前身是 `bright-tray`（Tauri v2 + Rust + Svelte + WebView2），常驻一个 Chromium 内核。这一版把前端整个删掉，界面用 GDI+ 直接画。
+原生 Windows 亮度控制。Win32 + GDI+，单个 399 KB 的 exe，无 WebView、无第三方运行时。界面全部由 GDI+ 矢量路径运行时绘制。
 
 ## 实测
 
@@ -44,7 +42,7 @@
 
 ## UI
 
-参考稿是竖向卡片：品牌字、刻度环、大旋钮、百分比、显示器胶囊、三个快捷按钮。全部由 GDI+ 矢量路径运行时绘制：
+界面是一张竖向卡片：品牌字、刻度环、大旋钮、百分比、显示器胶囊、三个快捷按钮。全部由 GDI+ 矢量路径运行时绘制：
 
 - 卡片：对角渐变 + 34 px 圆角 + 1 px 描边；绘制前先整幅铺一遍渐变底色——窗口 `SetWindowRgn` 的整数半径硬圆角与卡片抗锯齿圆角曲线不完全重合，铺底后两者之间的月牙缝隙不再露出未绘制的黑底（OSD 同理）
 - 环形轨道：300° 弧、13 px 粗，外阴影 + 基色 + 内侧高光三层叠加，呈现嵌入槽位感；底部留 60° 开口
@@ -76,7 +74,7 @@ g++ -std=c++17 -O2 -municode -mwindows -Wall -Wextra \
   -static -static-libgcc -static-libstdc++ -s
 ```
 
-工具链是本机 MSYS2 MinGW-w64（`%USERPROFILE%\.workbuddy\toolchains\msys64`）。
+工具链：MSYS2 MinGW-w64。构建前把含 `g++`、`windres` 的 `bin` 目录加入 `PATH` 即可，脚本本身不写死任何路径。
 
 ## 显示器名称
 

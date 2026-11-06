@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set ROOT=%~dp0
-set PATH=C:\Users\Eliauk\.workbuddy\toolchains\msys64\mingw64\bin;%PATH%
+rem Requires MinGW-w64 g++ and windres on PATH. Set PATH before calling this script.
 
 if not exist "%ROOT%tools\makeicon.exe" (
   g++ -std=c++17 -O2 -municode -o "%ROOT%tools\makeicon.exe" "%ROOT%tools\makeicon.cpp" -lgdiplus -lole32 -luuid -static-libgcc -static-libstdc++ -s
