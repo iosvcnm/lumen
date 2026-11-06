@@ -1,0 +1,11 @@
+# 构建产物（可由 build.bat / tools 源码重新生成）
+lumen.exe
+lumen.ico
+lumen_res.o
+tools/*.exe
+
+# UI 回归截图
+*.bmp
+
+# 临时补丁脚本
+_patch*.py
