@@ -93,6 +93,7 @@ struct Mon {
     bool primary = false;
     bool wmi = false;
     bool hdr = false;      // Windows 高级色 HDR 激活（OSD 硬件 HDR 检测不到）
+    ULONG sdrwl = 0;       // Windows SDR 内容白电平（HDR 激活时可读，随滑条变化）
     int  pct = 50;
     DWORD mn = 0, mx = 100;
 };
@@ -903,6 +904,7 @@ static bool RefreshHdrFlags(std::vector<Mon>& mons) {
                            modes.data(), nullptr) != ERROR_SUCCESS)
         return false;
     std::map<std::wstring, bool> hdrOf;
+    std::map<std::wstring, ULONG> wlOf;
     for (UINT32 i = 0; i < nPath; ++i) {
         DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
         src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
@@ -928,13 +930,26 @@ static bool RefreshHdrFlags(std::vector<Mon>& mons) {
             if (DisplayConfigGetDeviceInfo(&b.header) == ERROR_SUCCESS)
                 hdr = (b.value & 2) != 0;   // advancedColorEnabled
         }
+        ULONG wl = 0;
+        {
+            struct WLQ { DISPLAYCONFIG_DEVICE_INFO_HEADER header; ULONG SDRWhiteLevel; } w{};
+            w.header.type = (DISPLAYCONFIG_DEVICE_INFO_TYPE)DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            w.header.size = sizeof(w);
+            w.header.adapterId = paths[i].targetInfo.adapterId;
+            w.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&w.header) == ERROR_SUCCESS) wl = w.SDRWhiteLevel;
+        }
         hdrOf[src.viewGdiDeviceName] = hdr;
+        wlOf[src.viewGdiDeviceName] = wl;
     }
     bool changed = false;
     for (auto& m : mons) {
         auto it = hdrOf.find(m.dev);
         bool now = (it != hdrOf.end()) && it->second;
         if (now != m.hdr) { m.hdr = now; changed = true; }
+        auto iw = wlOf.find(m.dev);
+        ULONG wl = (iw != wlOf.end()) ? iw->second : 0;
+        if (wl != m.sdrwl) { m.sdrwl = wl; changed = true; }
     }
     return changed;
 }
@@ -1471,10 +1486,19 @@ static void DrawPanel(Graphics& g, int W, int H) {
         g.DrawString(L"HDR", -1, &fh2, chip, &sf, &ctb);
     }
 
-    // 提示
+    // 提示：HDR 激活时显示 Windows 白电平（滑条镜像）与 lumen 调光比例，两数语义分明
     SolidBrush hb(g_pal.hint);
     Font fh(L"Microsoft YaHei UI", 10, FontStyleRegular, UnitPixel);
-    g.DrawString(tr(S_HINT), -1, &fh, RectF(0, HINT_Y, (float)W, 16), &sf, &hb);
+    if (hdrNow) {
+        wchar_t hb2[96];
+        ULONG wl = 0;
+        if (g_sel >= 0 && g_sel < (int)g_mons.size()) wl = g_mons[g_sel].sdrwl;
+        else for (auto& mm : g_mons) if (mm.hdr && mm.sdrwl) { wl = mm.sdrwl; break; }
+        swprintf(hb2, 96, L"Windows 白电平 %lu · lumen 调光 %d%%", wl, g_val);
+        g.DrawString(hb2, -1, &fh, RectF(0, HINT_Y, (float)W, 16), &sf, &hb);
+    } else {
+        g.DrawString(tr(S_HINT), -1, &fh, RectF(0, HINT_Y, (float)W, 16), &sf, &hb);
+    }
 
     // 三个圆形快捷按钮：凸起拟物（落影 + 双向倒角），激活项图标琥珀/深蓝
     for (int i = 0; i < 3; ++i) {
