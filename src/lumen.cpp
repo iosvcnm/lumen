@@ -41,8 +41,6 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 
 #define HK_UP     9001
 #define HK_DOWN   9002
-#define HK_UP2    9003
-#define HK_DOWN2  9004
 #define HK_TOGGLE 9005
 #define ID_EXIT   4
 
@@ -103,6 +101,7 @@ static int  g_page = 0;   // 0 主面板 1 设置页
 static bool g_wantSettings = false;   // 首次建窗时直接进设置页
 static UINT g_hkUpMod = MOD_CONTROL, g_hkUpVk = VK_PRIOR;
 static UINT g_hkDownMod = MOD_CONTROL, g_hkDownVk = VK_NEXT;
+static UINT g_hkShowMod = MOD_CONTROL | MOD_ALT, g_hkShowVk = 'B';
 static int  g_capSlot = 0, g_hkMsg = 0;  // g_hkMsg: 0 无 / 1 被占用 / 2 需含 Ctrl 或 Alt
 static int  g_hover = -1;          // 0 胶囊，1..3 快捷按钮
 
@@ -176,6 +175,8 @@ static void LoadConfig() {
     g_hkUpVk   = (UINT)RegGet(L"HotUpVk", VK_PRIOR);
     g_hkDownMod = (UINT)RegGet(L"HotDownMod", MOD_CONTROL);
     g_hkDownVk  = (UINT)RegGet(L"HotDownVk", VK_NEXT);
+    g_hkShowMod = (UINT)RegGet(L"HotShowMod", MOD_CONTROL | MOD_ALT);
+    g_hkShowVk  = (UINT)RegGet(L"HotShowVk", 'B');
     g_cfgSel    = RegGetStr(L"SelMonitor", L"");
 }
 
@@ -203,19 +204,17 @@ static std::wstring HotkeyText(UINT mod, UINT vk) { return ModName(mod) + KeyNam
 
 static void ApplyHotkey(int slot, UINT mod, UINT vk) {
     if (!g_msg) return;
-    int id = (slot == 1) ? HK_UP : HK_DOWN;
-    UINT oldMod = (slot == 1) ? g_hkUpMod : g_hkDownMod;
-    UINT oldVk  = (slot == 1) ? g_hkUpVk : g_hkDownVk;
+    UINT* pMod = (slot == 1) ? &g_hkUpMod : (slot == 2) ? &g_hkDownMod : &g_hkShowMod;
+    UINT* pVk  = (slot == 1) ? &g_hkUpVk  : (slot == 2) ? &g_hkDownVk  : &g_hkShowVk;
+    int id = (slot == 1) ? HK_UP : (slot == 2) ? HK_DOWN : HK_TOGGLE;
+    const wchar_t* base = (slot == 1) ? L"HotUp" : (slot == 2) ? L"HotDown" : L"HotShow";
+    UINT oldMod = *pMod, oldVk = *pVk;
 
     UnregisterHotKey(g_msg, id);
     if (RegisterHotKey(g_msg, id, mod, vk)) {
-        if (slot == 1) {
-            g_hkUpMod = mod; g_hkUpVk = vk;
-            RegPut(L"HotUpMod", (int)mod); RegPut(L"HotUpVk", (int)vk);
-        } else {
-            g_hkDownMod = mod; g_hkDownVk = vk;
-            RegPut(L"HotDownMod", (int)mod); RegPut(L"HotDownVk", (int)vk);
-        }
+        *pMod = mod; *pVk = vk;
+        RegPut((std::wstring(base) + L"Mod").c_str(), (int)mod);
+        RegPut((std::wstring(base) + L"Vk").c_str(), (int)vk);
         g_hkMsg = 0;
     } else {
         RegisterHotKey(g_msg, id, oldMod, oldVk);
@@ -226,6 +225,7 @@ static void ApplyHotkey(int slot, UINT mod, UINT vk) {
 static void RegisterHotkeys() {
     RegisterHotKey(g_msg, HK_UP, g_hkUpMod, g_hkUpVk);
     RegisterHotKey(g_msg, HK_DOWN, g_hkDownMod, g_hkDownVk);
+    RegisterHotKey(g_msg, HK_TOGGLE, g_hkShowMod, g_hkShowVk);
 }
 
 // 热键录制：低级键盘钩子只观察不吞键，焦点不在本程序时也能捕获；
@@ -1324,7 +1324,7 @@ static void MiniButton(Graphics& g, float x, float y, bool plus) {
 
 // ---- 设置页几何：绘制与命中判定共用同一组矩形，避免两处漂移
 static const float SET_L = 36.f, SET_R = 364.f;
-static const float SET_HK = 410.f, SET_HK_STEP = 46.f;
+static const float SET_HK = 394.f, SET_HK_STEP = 44.f;
 
 static float  SetRowY(int i)          { return 112.f + i * 52.f; }
 static RectF  SetToggleRect(int i)    { return RectF(SET_R - 44.f, SetRowY(i) - 4.f, 44.f, 24.f); }
@@ -1393,12 +1393,12 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
         MiniButton(g, pr.X, pr.Y, true);
     }
 
-    g.DrawLine(&sep, SET_L, 366.f, SET_R, 366.f);
-    g.DrawString(L"全局快捷键", -1, &fsec, PointF(SET_L, 380), &tb);
+    g.DrawLine(&sep, SET_L, 356.f, SET_R, 356.f);
+    g.DrawString(L"全局快捷键", -1, &fsec, PointF(SET_L, 368), &tb);
 
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         float y = SET_HK + i * SET_HK_STEP;
-        g.DrawString(i == 0 ? L"上调" : L"下调", -1, &fl, PointF(SET_L, y + 6), &tb);
+        g.DrawString(i == 0 ? L"上调" : i == 1 ? L"下调" : L"呼出面板", -1, &fl, PointF(SET_L, y + 6), &tb);
 
         RectF kr = SetKeyRect(i);
         GraphicsPath kp;
@@ -1408,9 +1408,11 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
         Pen kpn(g_pal.pillEdge, 1.f);
         g.DrawPath(&kpn, &kp);
 
+        UINT hm = (i == 0) ? g_hkUpMod : (i == 1) ? g_hkDownMod : g_hkShowMod;
+        UINT hv = (i == 0) ? g_hkUpVk  : (i == 1) ? g_hkDownVk  : g_hkShowVk;
         std::wstring txt;
         if (g_capSlot == i + 1) txt = L"按下 Ctrl 或 Alt + 键…";
-        else txt = HotkeyText(i == 0 ? g_hkUpMod : g_hkDownMod, i == 0 ? g_hkUpVk : g_hkDownVk);
+        else txt = HotkeyText(hm, hv);
         SolidBrush& tc = (g_capSlot == i + 1) ? acc : sb;
         Font& kf = (g_capSlot == i + 1) ? fs : fl;
         g.DrawString(txt.c_str(), -1, &kf, kr, &cen, &tc);
@@ -1425,17 +1427,17 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
         g.DrawString(g_capSlot == i + 1 ? L"取消" : L"修改", -1, &fs, er, &cen, &tb);
     }
 
+    SolidBrush eb(g_pal.danger);
+    SolidBrush* msgBrush = &sb;
+    const wchar_t* msg = L"lumen · DDC/CI + WMI 混合控制";
     if (g_hkMsg == 1) {
-        SolidBrush eb(g_pal.danger);
-        g.DrawString(L"该组合已被其他程序占用，保留原快捷键", -1, &fs, PointF(SET_L, 502), &eb);
+        msg = L"该组合已被其他程序占用，保留原快捷键"; msgBrush = &eb;
     } else if (g_hkMsg == 2) {
-        SolidBrush eb(g_pal.danger);
-        g.DrawString(L"需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑", -1, &fs, PointF(SET_L, 502), &eb);
-    } else {
-        g.DrawString(L"组合需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑", -1, &fs, PointF(SET_L, 502), &sb);
+        msg = L"需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑"; msgBrush = &eb;
+    } else if (g_capSlot) {
+        msg = L"组合需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑";
     }
-
-    g.DrawString(L"lumen · DDC/CI + WMI 混合控制", -1, &fs, PointF(SET_L, H - 40.f), &sb);
+    g.DrawString(msg, -1, &fs, PointF(SET_L, H - 40.f), msgBrush);
 }
 
 // ---------------------------------------------------------------- 面板窗口过程
@@ -1740,7 +1742,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < 3; ++i) {
                 if (InRect(SetEditRect(i), x, y)) {
                     if (g_capSlot == i + 1) StopCapture();
                     else StartCapture(i + 1);
@@ -2010,6 +2012,7 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         if (wp == HK_UP) { Adjust(5); ShowOsd(); }
         else if (wp == HK_DOWN) { Adjust(-5); ShowOsd(); }
+        else if (wp == HK_TOGGLE) TogglePanel();
         return 0;
 
     case WM_SHOW:
@@ -2125,6 +2128,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_writer.Stop();
     UnregisterHotKey(g_msg, HK_UP);
     UnregisterHotKey(g_msg, HK_DOWN);
+    UnregisterHotKey(g_msg, HK_TOGGLE);
     RemoveTray();
     if (g_winHook) UnhookWinEvent(g_winHook);
     if (g_icon) DestroyIcon((HICON)g_icon);
