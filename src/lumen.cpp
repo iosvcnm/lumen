@@ -45,7 +45,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_NAMES   (WM_APP + 6)
 #define WM_UPDATE  (WM_APP + 7)   // wParam = new tag string (heap, receiver frees)
 
-#define APP_VERSION L"1.2.0"
+#define APP_VERSION L"1.2.1"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
