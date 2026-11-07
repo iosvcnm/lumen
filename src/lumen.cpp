@@ -222,10 +222,29 @@ static void ApplyHotkey(int slot, UINT mod, UINT vk) {
     }
 }
 
+static unsigned g_hkFail = 0;   // 位 1/2/4：上调/下调/呼出 注册失败（被占用）
+
 static void RegisterHotkeys() {
-    RegisterHotKey(g_msg, HK_UP, g_hkUpMod, g_hkUpVk);
-    RegisterHotKey(g_msg, HK_DOWN, g_hkDownMod, g_hkDownVk);
-    RegisterHotKey(g_msg, HK_TOGGLE, g_hkShowMod, g_hkShowVk);
+    if (!RegisterHotKey(g_msg, HK_UP, g_hkUpMod, g_hkUpVk))         g_hkFail |= 1;
+    if (!RegisterHotKey(g_msg, HK_DOWN, g_hkDownMod, g_hkDownVk))   g_hkFail |= 2;
+    if (!RegisterHotKey(g_msg, HK_TOGGLE, g_hkShowMod, g_hkShowVk)) g_hkFail |= 4;
+}
+
+// 启动时若有热键注册失败，用托盘气泡告知（只提示一次；录制路径已有面板内红字反馈）
+static void NotifyHotkeyFailures() {
+    if (!g_hkFail || !g_tray) return;
+    std::wstring t;
+    if (g_hkFail & 1) t += L"亮度上调 " + HotkeyText(g_hkUpMod, g_hkUpVk) + L"：组合被占用\n";
+    if (g_hkFail & 2) t += L"亮度下调 " + HotkeyText(g_hkDownMod, g_hkDownVk) + L"：组合被占用\n";
+    if (g_hkFail & 4) t += L"呼出面板 " + HotkeyText(g_hkShowMod, g_hkShowVk) + L"：组合被占用";
+    while (!t.empty() && t.back() == L'\n') t.pop_back();
+    g_nid.uFlags |= NIF_INFO;
+    wcsncpy(g_nid.szInfo, t.c_str(), 255);  g_nid.szInfo[255] = 0;
+    wcsncpy(g_nid.szInfoTitle, L"lumen", 63); g_nid.szInfoTitle[63] = 0;
+    g_nid.dwInfoFlags = NIIF_WARNING;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_nid.uFlags &= ~NIF_INFO;      // 还原标志：之后的 NIM_MODIFY 不再携带气泡
+    g_hkFail = 0;
 }
 
 // 热键录制：低级键盘钩子只观察不吞键，焦点不在本程序时也能捕获；
@@ -1123,7 +1142,12 @@ static void DrawPanel(Graphics& g, int W, int H) {
         g.DrawEllipse(&be, cx - rr, BTN_CY - rr, rr * 2, rr * 2);
 
         Color ic = (i == 1 && g_cfgAuto) ? g_pal.progDot : g_pal.sub;
-        if (i == 0) DrawDayNight(g, cx, BTN_CY, 11.f, ic);
+        if (i == 0) {
+            // 按钮图标反映主题模式：自动=昼夜组合，强制时为太阳/月亮
+            if (g_cfgTheme == 0) DrawDayNight(g, cx, BTN_CY, 11.f, ic);
+            else if (g_dark)     DrawMoon(g, cx, BTN_CY, 11.f, ic);
+            else                 DrawSun(g, cx, BTN_CY, 11.f, ic);
+        }
         else if (i == 1) DrawAuto(g, cx, BTN_CY, 10.f, ic);
         else DrawGear(g, cx, BTN_CY, 10.5f, ic);
     }
@@ -1232,6 +1256,8 @@ static void OnPanelPaint(HWND hwnd) {
 
 // ---------------------------------------------------------------- OSD
 
+static wchar_t g_osdMode[12] = L"";   // 非空：OSD 显示主题模式而非亮度百分比
+
 static void OnOsdPaint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -1260,6 +1286,22 @@ static void OnOsdPaint(HWND hwnd) {
     Pen edge(g_pal.border, 1.f);
     g.DrawPath(&edge, &p);
 
+    Font fsub(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
+    SolidBrush sb(g_pal.osdSub);
+    if (g_osdMode[0]) {
+        Font fm(L"Microsoft YaHei UI", 20, FontStyleBold, UnitPixel);
+        SolidBrush tb(g_pal.osdText);
+        StringFormat cen;
+        cen.SetAlignment(StringAlignmentCenter);
+        cen.SetLineAlignment(StringAlignmentCenter);
+        g.DrawString(g_osdMode, -1, &fm, RectF(0, 0, 190, 44), &cen, &tb);
+        g.DrawString(L"主题", -1, &fsub, RectF(0, 40, 190, 22), &cen, &sb);
+        Graphics dst(hdc);
+        dst.DrawImage(&buf, 0, 0);
+        EndPaint(hwnd, &ps);
+        return;
+    }
+
     wchar_t buf2[32];
     swprintf(buf2, 32, L"%d%%", g_val);
     Font f(L"Consolas", 26, FontStyleBold, UnitPixel);
@@ -1269,17 +1311,14 @@ static void OnOsdPaint(HWND hwnd) {
     sf.SetLineAlignment(StringAlignmentCenter);
     g.DrawString(buf2, -1, &f, RectF(20, 0, 90, 62), &sf, &tb);
 
-    Font fs(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
-    Font fsec(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
-    SolidBrush sb(g_pal.osdSub);
-    g.DrawString(L"亮度", -1, &fs, RectF(88, 0, 80, 62), &sf, &sb);
+    g.DrawString(L"亮度", -1, &fsub, RectF(88, 0, 80, 62), &sf, &sb);
 
     Graphics dst(hdc);
     dst.DrawImage(&buf, 0, 0);
     EndPaint(hwnd, &ps);
 }
 
-static void ShowOsd() {
+static void ShowOsdNow() {
     if (!g_osd) {
         g_osd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
             kOsdClass, L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, g_inst, nullptr);
@@ -1295,6 +1334,17 @@ static void ShowOsd() {
     ShowWindow(g_osd, SW_SHOWNOACTIVATE);
     InvalidateRect(g_osd, nullptr, FALSE);
     SetTimer(g_osd, 1, 1400, nullptr);
+}
+
+static void ShowOsd() {
+    g_osdMode[0] = 0;
+    ShowOsdNow();
+}
+
+static void ShowOsdMode(const wchar_t* m) {
+    wcsncpy(g_osdMode, m, 11);
+    g_osdMode[11] = 0;
+    ShowOsdNow();
 }
 
 // ---------------------------------------------------------------- 设置窗口
@@ -1622,10 +1672,12 @@ static int HitButton(int x, int y) {
 
 static void OnQuickAction(int idx) {
     if (idx == 1) {
-        g_cfgTheme = g_dark ? 1 : 2;
+        // 跟随系统时切到当前观感的反色；强制浅/深时一键回「跟随系统」
+        g_cfgTheme = (g_cfgTheme == 0) ? (g_dark ? 1 : 2) : 0;
         RegPut(L"ThemeMode", g_cfgTheme);
         LoadTheme();
         AddTray();
+        ShowOsdMode(g_cfgTheme == 0 ? L"自动" : (g_dark ? L"深色" : L"浅色"));
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
     } else if (idx == 2) {
         g_cfgAuto = g_cfgAuto ? 0 : 1;
@@ -1869,8 +1921,11 @@ static HICON MakeIcon(int size) {
     float c = size / 2.f, r = size * 0.46f;
     SolidBrush bg(g_dark ? Color(255, 22, 33, 47) : Color(255, 255, 255, 255));
     g.FillEllipse(&bg, c - r, c - r, r * 2, r * 2);
-    if (g_dark) DrawMoon(g, c, c, size * 0.26f, Color(255, 232, 192, 122));
-    else        DrawSun(g, c, c, size * 0.26f, Color(255, 122, 150, 186));
+    if (g_cfgTheme == 0)                       // 跟随系统：昼夜组合图标
+        DrawDayNight(g, c, c, size * 0.36f, g_dark ? Color(255, 232, 192, 122)
+                                                   : Color(255, 122, 150, 186));
+    else if (g_dark) DrawMoon(g, c, c, size * 0.26f, Color(255, 232, 192, 122));
+    else             DrawSun(g, c, c, size * 0.26f, Color(255, 122, 150, 186));
 
     HBITMAP hb = nullptr;
     bmp.GetHBITMAP(Color(0, 0, 0, 0), &hb);
@@ -1901,6 +1956,8 @@ static void AddTray() {
     wcsncpy(g_nid.szTip, L"lumen", 127);
     g_nid.szTip[127] = 0;
     g_tray = Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
+    g_nid.uVersion = NOTIFYICON_VERSION;   // 3：lp=消息，HIWORD(wp)=滚轮增量；点击语义不变
+    if (g_tray) Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
 }
 
 static void RemoveTray() {
@@ -2004,10 +2061,17 @@ static void ApplyAutoBrightness() {
 
 static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_TRAY:
-        if (LOWORD(lp) == WM_LBUTTONUP) TogglePanel();
-        else if (LOWORD(lp) == WM_RBUTTONUP) ShowMenu();
+    case WM_TRAY: {
+        UINT tmsg = (UINT)LOWORD(lp);
+        if (tmsg == WM_MOUSEWHEEL) {          // 托盘图标上滚轮：直接调亮度
+            short d = (short)HIWORD(wp);
+            if (d) { Post(g_val + (d > 0 ? 5 : -5)); ShowOsd(); }
+            return 0;
+        }
+        if (tmsg == WM_LBUTTONUP) TogglePanel();
+        else if (tmsg == WM_RBUTTONUP) ShowMenu();
         return 0;
+    }
 
     case WM_HOTKEY:
         if (wp == HK_UP) { Adjust(5); ShowOsd(); }
@@ -2085,7 +2149,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (setctx) setctx((HANDLE)-4);
 
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"lumen.single.instance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 已有实例在跑：唤起它的面板后退出（再次双击 exe = 弹面板）
+        if (HWND prev = FindWindowW(kMsgClass, nullptr))
+            PostMessageW(prev, WM_SHOW, 0, 0);
+        return 0;
+    }
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     CoInitializeSecurity(nullptr, -1, nullptr, nullptr, RPC_C_AUTHN_LEVEL_DEFAULT,
@@ -2105,6 +2174,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     AddTray();
     RegisterHotkeys();
+    NotifyHotkeyFailures();
     SetTimer(g_msg, 2, 60000, nullptr);
     g_winHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
                                 nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
