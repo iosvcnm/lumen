@@ -12,6 +12,8 @@
 #include <highlevelmonitorconfigurationapi.h>
 #include <physicalmonitorenumerationapi.h>
 #include <wbemidl.h>
+#include <winhttp.h>
+#include <ws2tcpip.h>
 
 #include <vector>
 #include <string>
@@ -21,6 +23,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <atomic>
 #include <algorithm>
@@ -30,6 +34,7 @@ using namespace Gdiplus;
 
 static const double PI = 3.14159265358979323846;
 static const wchar_t* kMsgClass   = L"LumenMsgWnd";
+static const wchar_t* kBcastClass = L"LumenBcastWnd";   // 顶层隐藏：接收系统广播转发给 g_msg
 static const wchar_t* kPanelClass = L"LumenPanelWnd";
 static const wchar_t* kOsdClass   = L"LumenOsdWnd";
 static const wchar_t* kCfgKey     = L"Software\\lumen";
@@ -38,6 +43,9 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_SHOW   (WM_APP + 2)
 #define WM_AUTOHIDE (WM_APP + 4)
 #define WM_NAMES   (WM_APP + 6)
+#define WM_UPDATE  (WM_APP + 7)   // wParam = new tag string (heap, receiver frees)
+
+#define APP_VERSION L"1.2.0"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
@@ -109,7 +117,8 @@ struct Pal {
     Color bg1, bg2, ring, dotOn, dotOff, knob1, knob2, knobEdge,
           icon, text, sub, hint, pill, pillEdge, btn1, btn2, shadow,
           track, trackShade, prog, progDot,
-          pillHover, menuBg, menuHover, danger, osdBg, osdText, osdSub, border;
+          pillHover, menuBg, menuHover, danger, osdBg, osdText, osdSub, border,
+          raisedHi, raisedSh, disc, discSh, iconHi;   // 拟物：左上高光 / 右下落影 / 凹盘 / 浮雕高光
 };
 static Pal g_pal;
 
@@ -117,6 +126,55 @@ static int Scale(int v) { return MulDiv(v, g_dpi, 96); }
 
 // 面板整体缩到 86%，逻辑坐标仍按 400x570 绘制
 static const float UI_SCALE = 0.86f;
+
+// ---------------------------------------------------------------- 多语言（0 跟随系统 / 1 中文 / 2 English）
+static int g_lang = 0;
+static int g_step = 5;   // 滚轮/热键步长，可调 1/2/5/10
+enum {
+    S_BRIGHTNESS, S_THEME, S_AUTO, S_LIGHT, S_DARK,
+    S_ALLMON, S_NOCTRL, S_ALLMONFMT, S_BUILTIN, S_PRIMARY, S_EXTERNAL, S_NOADJ,
+    S_BUILTINSCR, S_GENERICFMT,
+    S_HINT, S_FAIL, S_BACK, S_SETTINGS, S_AUTOSTART, S_AUTOBR, S_STARTH, S_ENDH, S_DDC, S_STEP,
+    S_HOTKEYS, S_UP, S_DOWN, S_SHOWPILL, S_PRESSKEY, S_OCCUPIED, S_NEEDMOD, S_MODIFY, S_CANCEL, S_SIG,
+    S_SHOWPANEL, S_BRIGHTUP, S_BRIGHTDN, S_DIAG, S_EXIT, S_LANG,
+    S_OCCUPFMT, S_UPDATEFMT,
+    S_COUNT
+};
+static const wchar_t* const STR_CN[S_COUNT] = {
+    L"亮度", L"主题", L"自动", L"浅色", L"深色",
+    L"全部显示器", L"未检测到可控显示器", L"全部显示器 (%d 台)", L" (内置)", L" (主显示器)", L" (副屏)", L" · 不可调",
+    L"内置显示屏", L"通用外接显示器 %d",
+    L"点击切换显示器", L"写入失败：检查 DDC/CI", L"←  返回", L"设置", L"开机自启", L"按时间自动调节",
+    L"开始时间", L"结束时间", L"DDC 间隔", L"步长",
+    L"全局快捷键", L"上调", L"下调", L"呼出面板", L"按下 Ctrl 或 Alt + 键…", L"该组合已被其他程序占用，保留原快捷键",
+    L"需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑", L"修改", L"取消",
+    L"lumen · DDC/CI + WMI 混合控制",
+    L"显示面板", L"亮度 +10", L"亮度 -10", L"复制诊断信息", L"退出 lumen", L"语言",
+    L"%ls %ls：组合被占用", L"lumen 有新版本 %ls\nhttps://github.com/iosvcnm/lumen/releases/latest",
+};
+static const wchar_t* const STR_EN[S_COUNT] = {
+    L"Brightness", L"Theme", L"Auto", L"Light", L"Dark",
+    L"All monitors", L"No controllable monitor", L"All monitors (%d)", L" (built-in)", L" (primary)", L" (secondary)", L" · fixed",
+    L"Builtin display", L"Generic monitor %d",
+    L"Click to switch monitor", L"Write failed: check DDC/CI", L"←  Back", L"Settings", L"Start with Windows", L"Time-based auto",
+    L"Start time", L"End time", L"DDC delay", L"Step",
+    L"Global hotkeys", L"Up", L"Down", L"Show", L"Press Ctrl or Alt + key…", L"Combo occupied by another app, keeping the old one",
+    L"Needs Ctrl or Alt, e.g. Ctrl+Alt+Up", L"Edit", L"Cancel",
+    L"lumen · DDC/CI + WMI hybrid control",
+    L"Show panel", L"Brightness +10", L"Brightness -10", L"Copy diagnostics", L"Exit lumen", L"Language",
+    L"%ls %ls: combo occupied", L"lumen %ls is available\nhttps://github.com/iosvcnm/lumen/releases/latest",
+};
+static const wchar_t* tr(int id) { return (g_lang == 2) ? STR_EN[id] : STR_CN[id]; }
+static int RegGet(const wchar_t* name, int def);   // 定义在配置区，ApplyLang 先用
+static void ApplyLang() {
+    int v = RegGet(L"Lang", 0);
+    if (v == 0) {
+        WORD u = GetUserDefaultUILanguage();
+        g_lang = (u >= 0x0800 && (u & 0xFF00) == 0x0800 && PRIMARYLANGID(u) == LANG_CHINESE) ? 1 : 2;
+    } else {
+        g_lang = v;   // 1 中文 / 2 English
+    }
+}
 
 static void AddTray();
 
@@ -178,6 +236,9 @@ static void LoadConfig() {
     g_hkShowMod = (UINT)RegGet(L"HotShowMod", MOD_CONTROL | MOD_ALT);
     g_hkShowVk  = (UINT)RegGet(L"HotShowVk", 'B');
     g_cfgSel    = RegGetStr(L"SelMonitor", L"");
+    int st = RegGet(L"Step", 5);
+    g_step = (st == 1 || st == 2 || st == 5 || st == 10) ? st : 5;
+    ApplyLang();
 }
 
 static std::wstring KeyName(UINT vk) {
@@ -234,9 +295,10 @@ static void RegisterHotkeys() {
 static void NotifyHotkeyFailures() {
     if (!g_hkFail || !g_tray) return;
     std::wstring t;
-    if (g_hkFail & 1) t += L"亮度上调 " + HotkeyText(g_hkUpMod, g_hkUpVk) + L"：组合被占用\n";
-    if (g_hkFail & 2) t += L"亮度下调 " + HotkeyText(g_hkDownMod, g_hkDownVk) + L"：组合被占用\n";
-    if (g_hkFail & 4) t += L"呼出面板 " + HotkeyText(g_hkShowMod, g_hkShowVk) + L"：组合被占用";
+    wchar_t b[192];
+    if (g_hkFail & 1) { swprintf(b, 192, tr(S_OCCUPFMT), tr(S_UP), HotkeyText(g_hkUpMod, g_hkUpVk).c_str());   t += b; t += L"\n"; }
+    if (g_hkFail & 2) { swprintf(b, 192, tr(S_OCCUPFMT), tr(S_DOWN), HotkeyText(g_hkDownMod, g_hkDownVk).c_str()); t += b; t += L"\n"; }
+    if (g_hkFail & 4) { swprintf(b, 192, tr(S_OCCUPFMT), tr(S_SHOWPILL), HotkeyText(g_hkShowMod, g_hkShowVk).c_str()); t += b; }
     while (!t.empty() && t.back() == L'\n') t.pop_back();
     g_nid.uFlags |= NIF_INFO;
     wcsncpy(g_nid.szInfo, t.c_str(), 255);  g_nid.szInfo[255] = 0;
@@ -358,58 +420,64 @@ static void LoadTheme() {
     }
 
     if (g_dark) {
-        g_pal.bg1       = Color(255, 20, 32, 47);
-        g_pal.bg2       = Color(255, 11, 18, 28);
-        g_pal.ring      = Color(255, 38, 54, 74);
-        g_pal.dotOn     = Color(255, 232, 192, 122);
-        g_pal.dotOff    = Color(255, 40, 56, 78);
-        g_pal.knob1     = Color(255, 34, 48, 66);
-        g_pal.knob2     = Color(255, 20, 30, 43);
-        g_pal.knobEdge  = Color(255, 44, 60, 80);
-        g_pal.icon      = Color(255, 232, 192, 122);
-        g_pal.text      = Color(255, 231, 238, 247);
-        g_pal.sub       = Color(255, 150, 168, 190);
-        g_pal.hint      = Color(255, 96, 116, 140);
-        g_pal.pill      = Color(255, 25, 37, 52);
-        g_pal.pillEdge  = Color(255, 42, 58, 78);
-        g_pal.btn1      = Color(255, 34, 48, 66);
-        g_pal.btn2      = Color(255, 21, 31, 45);
-        g_pal.shadow    = Color(48, 0, 0, 0);
-        g_pal.track     = Color(255, 34, 48, 66);
-        g_pal.trackShade= Color(255, 8, 13, 20);
-        g_pal.prog      = Color(255, 232, 192, 122);
-        g_pal.progDot   = Color(255, 244, 214, 160);
-        g_pal.pillHover = Color(255, 38, 54, 74);
-        g_pal.menuBg    = Color(252, 27, 39, 54);
-        g_pal.menuHover = Color(255, 44, 60, 80);
+        g_pal.bg1       = Color(255, 38, 48, 63);      // 深哑光午夜石板
+        g_pal.bg2       = Color(255, 20, 27, 39);
+        g_pal.ring      = Color(255, 46, 58, 76);
+        g_pal.dotOn     = Color(255, 232, 192, 122);   // 琥珀刻度
+        g_pal.dotOff    = Color(255, 58, 70, 90);
+        g_pal.knob1     = Color(255, 58, 70, 90);      // 旋钮环受光面
+        g_pal.knob2     = Color(255, 28, 37, 52);      // 背光面
+        g_pal.knobEdge  = Color(255, 62, 76, 100);
+        g_pal.icon      = Color(255, 240, 184, 94);    // 琥珀发光图标
+        g_pal.iconHi    = Color(70, 255, 224, 150);
+        g_pal.text      = Color(255, 233, 240, 249);
+        g_pal.sub       = Color(255, 146, 162, 186);
+        g_pal.hint      = Color(255, 92, 108, 134);
+        g_pal.pill      = Color(255, 40, 50, 67);
+        g_pal.pillEdge  = Color(255, 58, 70, 92);
+        g_pal.btn1      = Color(255, 54, 66, 86);
+        g_pal.btn2      = Color(255, 30, 39, 54);
+        g_pal.shadow    = Color(120, 0, 0, 0);
+        g_pal.track     = Color(255, 34, 44, 61);
+        g_pal.trackShade= Color(255, 9, 13, 21);
+        g_pal.prog      = Color(255, 240, 184, 94);
+        g_pal.progDot   = Color(255, 255, 217, 143);
+        g_pal.pillHover = Color(255, 48, 60, 79);
+        g_pal.menuBg    = Color(252, 30, 42, 58);
+        g_pal.menuHover = Color(255, 48, 62, 84);
         g_pal.danger    = Color(255, 226, 130, 130);
-        g_pal.osdBg     = Color(240, 20, 30, 44);
+        g_pal.osdBg     = Color(240, 24, 34, 48);
         g_pal.osdText   = Color(255, 240, 245, 252);
         g_pal.osdSub    = Color(255, 168, 184, 204);
-        g_pal.border    = Color(34, 255, 255, 255);
+        g_pal.border    = Color(30, 255, 255, 255);
+        g_pal.raisedHi  = Color(36, 255, 255, 255);
+        g_pal.raisedSh  = Color(120, 0, 0, 0);
+        g_pal.disc      = Color(255, 31, 41, 56);
+        g_pal.discSh    = Color(255, 9, 13, 21);
     } else {
-        g_pal.bg1       = Color(255, 250, 252, 255);
-        g_pal.bg2       = Color(255, 231, 238, 248);
-        g_pal.ring      = Color(255, 219, 230, 242);
-        g_pal.dotOn     = Color(255, 122, 150, 186);
-        g_pal.dotOff    = Color(255, 226, 236, 246);
-        g_pal.knob1     = Color(255, 255, 255, 255);
-        g_pal.knob2     = Color(255, 233, 240, 249);
-        g_pal.knobEdge  = Color(255, 220, 231, 243);
-        g_pal.icon      = Color(255, 152, 173, 200);
-        g_pal.text      = Color(255, 62, 80, 102);
-        g_pal.sub       = Color(255, 120, 140, 164);
-        g_pal.hint      = Color(255, 158, 176, 196);
-        g_pal.pill      = Color(255, 232, 239, 248);
-        g_pal.pillEdge  = Color(255, 213, 224, 238);
-        g_pal.btn1      = Color(255, 252, 254, 255);
-        g_pal.btn2      = Color(255, 228, 236, 247);
-        g_pal.shadow    = Color(28, 70, 100, 140);
-        g_pal.track     = Color(255, 217, 228, 241);
-        g_pal.trackShade= Color(255, 196, 210, 227);
-        g_pal.prog      = Color(255, 64, 89, 123);
-        g_pal.progDot   = Color(255, 92, 120, 160);
-        g_pal.pillHover = Color(255, 223, 233, 245);
+        g_pal.bg1       = Color(255, 247, 250, 253);   // 黏土白 / 温润浅灰蓝
+        g_pal.bg2       = Color(255, 232, 238, 246);
+        g_pal.ring      = Color(255, 246, 249, 253);
+        g_pal.dotOn     = Color(255, 143, 163, 190);
+        g_pal.dotOff    = Color(255, 214, 223, 235);
+        g_pal.knob1     = Color(255, 253, 254, 255);   // 旋钮环受光面
+        g_pal.knob2     = Color(255, 219, 228, 240);   // 背光面
+        g_pal.knobEdge  = Color(255, 203, 214, 230);
+        g_pal.icon      = Color(255, 146, 166, 194);   // 浮雕太阳
+        g_pal.iconHi    = Color(230, 255, 255, 255);
+        g_pal.text      = Color(255, 52, 68, 90);
+        g_pal.sub       = Color(255, 124, 140, 164);
+        g_pal.hint      = Color(255, 168, 180, 198);
+        g_pal.pill      = Color(255, 246, 250, 254);
+        g_pal.pillEdge  = Color(255, 216, 225, 238);
+        g_pal.btn1      = Color(255, 251, 253, 255);
+        g_pal.btn2      = Color(255, 231, 238, 248);
+        g_pal.shadow    = Color(70, 118, 136, 162);
+        g_pal.track     = Color(255, 229, 236, 245);
+        g_pal.trackShade= Color(255, 203, 214, 229);
+        g_pal.prog      = Color(255, 46, 74, 107);     // 深蓝进度弧
+        g_pal.progDot   = Color(255, 70, 97, 138);
+        g_pal.pillHover = Color(255, 236, 242, 250);
         g_pal.menuBg    = Color(253, 255, 255, 255);
         g_pal.menuHover = Color(255, 233, 241, 250);
         g_pal.danger    = Color(255, 176, 74, 74);
@@ -417,6 +485,10 @@ static void LoadTheme() {
         g_pal.osdText   = Color(255, 58, 76, 98);
         g_pal.osdSub    = Color(255, 126, 146, 170);
         g_pal.border    = Color(26, 120, 150, 185);
+        g_pal.raisedHi  = Color(215, 255, 255, 255);
+        g_pal.raisedSh  = Color(85, 122, 138, 164);
+        g_pal.disc      = Color(255, 238, 243, 249);
+        g_pal.discSh    = Color(255, 200, 211, 226);
     }
 }
 
@@ -662,7 +734,7 @@ static std::vector<Mon> Scan() {
         Mon m;
         m.dev = L"WMI";
         m.key = L"WMI";
-        m.name = L"内置显示器";
+        m.name = tr(S_BUILTINSCR);
         m.controllable = true;
         m.wmi = true;
         m.pct = std::min(100, wv);
@@ -747,13 +819,15 @@ static void ApplyNames(std::vector<Mon>& mons) {
     }
     int generic = 0;
     for (auto& m : mons) {
-        if (m.wmi) { m.name = L"内置显示屏"; continue; }
+        if (m.wmi) { m.name = tr(S_BUILTINSCR); continue; }
         auto it = cache.find(m.dev);
         if (it != cache.end() && !it->second.empty()) {
             m.name = it->second;
         } else {
             ++generic;
-            m.name = L"通用外接显示器 " + std::to_wstring(generic);
+            wchar_t b[64];
+            swprintf(b, 64, tr(S_GENERICFMT), generic);
+            m.name = b;
         }
     }
     std::map<std::wstring, int> cnt, seen;
@@ -841,6 +915,9 @@ static void Post(int pct) {
     if (g_sel >= 0 && g_sel < (int)g_mons.size()) devs.push_back(g_mons[g_sel].dev);
     else for (auto& m : g_mons) if (m.controllable) devs.push_back(m.dev);
     g_writer.Post(devs, pct);
+    for (auto& d : devs)
+        for (auto& m : g_mons)
+            if (m.dev == d) RegPut((L"Last_" + m.key).c_str(), pct);   // 记住每台屏的亮度，唤醒/重启后恢复
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -855,6 +932,49 @@ static void Adjust(int delta) {
     for (auto& m : g_mons) if (m.controllable) { sum += m.pct; ++n; }
     Post((n ? sum / n : g_val) + delta);
     for (auto& m : g_mons) if (m.controllable) m.pct = g_val;
+}
+
+// 唤醒/重启后按 PnPId 恢复每台屏上次的亮度（与注册表记录不同才写）
+static void RestoreBrightness() {
+    for (auto& m : g_mons) {
+        if (!m.controllable) continue;
+        int last = RegGet((L"Last_" + m.key).c_str(), -1);
+        if (last < 0 || last > 100 || last == m.pct) continue;
+        m.pct = last;
+        g_writer.Post({ m.dev }, last);
+    }
+    int sum = 0, n = 0;
+    for (auto& m : g_mons) if (m.controllable) { sum += m.pct; ++n; }
+    if (n) g_val = sum / n;
+}
+
+// 一键诊断：显示器清单 + 配置 + 快捷键，复制到剪贴板（托盘菜单 / cmd 6）
+static void CopyDiagnostics() {
+    if (g_mons.empty()) g_mons = Scan();
+    std::wstring t = std::wstring(L"lumen ") + APP_VERSION;
+    wchar_t b[320];
+    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d",
+             g_lang, g_cfgTheme, g_step, g_cfgDelay, g_cfgAuto, g_cfgStartH, g_cfgEndH, g_cfgStart);
+    t += b;
+    swprintf(b, 320, L"\r\nhotkeys: up=%ls down=%ls show=%ls",
+             HotkeyText(g_hkUpMod, g_hkUpVk).c_str(),
+             HotkeyText(g_hkDownMod, g_hkDownVk).c_str(),
+             HotkeyText(g_hkShowMod, g_hkShowVk).c_str());
+    t += b;
+    for (auto& m : g_mons) {
+        swprintf(b, 320, L"\r\nmonitor: %ls | key=%ls | dev=%ls | ctrl=%d pct=%d",
+                 m.name.c_str(), m.key.c_str(), m.dev.c_str(), m.controllable ? 1 : 0, m.pct);
+        t += b;
+    }
+    if (!OpenClipboard(g_msg)) return;
+    EmptyClipboard();
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (t.size() + 1) * sizeof(wchar_t));
+    if (h) {
+        memcpy(GlobalLock(h), t.c_str(), (t.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(h);
+        SetClipboardData(CF_UNICODETEXT, h);
+    }
+    CloseClipboard();
 }
 
 // ---------------------------------------------------------------- 绘制基础
@@ -1002,91 +1122,148 @@ static void DrawPanel(Graphics& g, int W, int H) {
     Font brand(L"Consolas", 19, FontStyleBold, UnitPixel);
     DrawTracked(g, L"lumen", brand, tb, W / 2.f, 24.f, 5.0f);
 
-    // 外圈刻度点：300° 弧，底部留 60° 死区
-    const int N = 60;
+    // —— 拟物旋钮：三层立体结构，45° 左上光源 ——
+    const float PLATEAU_R = 178.f;   // L1 底座台阶
+    const float DOT_RING  = 118.f;   // 刻度点环（内移至旋钮环与进度弧之间）
+    const float RING_O = 98.f;       // L2 旋钮环外沿
+    const float RING_I = 64.f;       // L3 中心凹盘半径
+
+    // L1 底座台阶：凸起圆盘 + 落影 + 左上高光 / 右下投影
+    {
+        SolidBrush ds(g_pal.raisedSh);
+        g.FillEllipse(&ds, KNOB_CX - PLATEAU_R + 3, KNOB_CY - PLATEAU_R + 5.5f,
+                      PLATEAU_R * 2, PLATEAU_R * 2);
+        LinearGradientBrush pl(PointF(KNOB_CX, KNOB_CY - PLATEAU_R),
+                               PointF(KNOB_CX, KNOB_CY + PLATEAU_R), g_pal.ring, g_pal.bg2);
+        g.FillEllipse(&pl, KNOB_CX - PLATEAU_R, KNOB_CY - PLATEAU_R, PLATEAU_R * 2, PLATEAU_R * 2);
+        Pen hiP(g_pal.raisedHi, 2.6f);
+        g.DrawArc(&hiP, KNOB_CX - PLATEAU_R, KNOB_CY - PLATEAU_R, PLATEAU_R * 2, PLATEAU_R * 2, 150, 115);
+        Pen shP(Color(60, g_pal.raisedSh.GetR(), g_pal.raisedSh.GetG(), g_pal.raisedSh.GetB()), 2.6f);
+        g.DrawArc(&shP, KNOB_CX - PLATEAU_R, KNOB_CY - PLATEAU_R, PLATEAU_R * 2, PLATEAU_R * 2, -40, 115);
+    }
+
+    // 刻度点：覆盖段着色；深色主题琥珀微光
+    const int N = 36;
     for (int i = 0; i < N; ++i) {
         double t = 210.0 + 300.0 * i / (N - 1);
         double a = (t - 90.0) * PI / 180.0;
-        float x = KNOB_CX + DOT_R * (float)cos(a);
-        float y = KNOB_CY + DOT_R * (float)sin(a);
+        float x = KNOB_CX + DOT_RING * (float)cos(a);
+        float y = KNOB_CY + DOT_RING * (float)sin(a);
         bool on = (i * 100.0 / N) <= g_val;
+        float r = on ? 3.2f : 2.3f;
+        if (on && g_dark) {
+            SolidBrush halo(Color(70, g_pal.dotOn.GetR(), g_pal.dotOn.GetG(), g_pal.dotOn.GetB()));
+            g.FillEllipse(&halo, x - r * 2.4f, y - r * 2.4f, r * 4.8f, r * 4.8f);
+        }
         SolidBrush b(on ? g_pal.dotOn : g_pal.dotOff);
-        float r = on ? 3.4f : 2.5f;
         g.FillEllipse(&b, x - r, y - r, r * 2, r * 2);
     }
 
-    // 轨道槽位：外阴影 + 基色 + 内侧高光，呈现嵌入感
-    float tr = TRACK_R, tw = 13.f;
-    RectF arc(KNOB_CX - tr, KNOB_CY - tr, tr * 2, tr * 2);
-    Pen shade(g_pal.trackShade, tw + 1.5f);
-    g.DrawArc(&shade, arc.X, arc.Y + 2.f, arc.Width, arc.Height, 120, 300);
-    Pen trackPen(g_pal.track, tw);
-    g.DrawArc(&trackPen, arc.X, arc.Y, arc.Width, arc.Height, 120, 300);
-    Pen innerHi(Color(34, 255, 255, 255), 2.f);
-    g.DrawArc(&innerHi, arc.X + 4, arc.Y + 4, arc.Width - 8, arc.Height - 8, 120, 300);
-
-    // 亮度进度弧 + 终点高亮
+    // 进度弧槽（内阴影感） + 亮度进度弧（深色主题带辉光）
+    float trk = TRACK_R, tw = 13.f;
+    RectF arc(KNOB_CX - trk, KNOB_CY - trk, trk * 2, trk * 2);
+    Pen shade(g_pal.trackShade, tw + 3.f);
+    g.DrawArc(&shade, arc.X, arc.Y, arc.Width, arc.Height, 120, 300);
+    Pen groove(g_pal.track, tw);
+    g.DrawArc(&groove, arc.X, arc.Y, arc.Width, arc.Height, 120, 300);
     if (g_val > 0) {
         double sweep = g_val / 100.0 * 300.0;
+        if (g_dark) {
+            for (int gp = 3; gp >= 1; --gp) {
+                Pen glow(Color(gp * 30, g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB()),
+                         tw + gp * 5.f);
+                g.DrawArc(&glow, arc.X, arc.Y, arc.Width, arc.Height, 120, (REAL)sweep);
+            }
+        }
         Pen prog(g_pal.prog, tw);
         prog.SetStartCap(LineCapRound);
         prog.SetEndCap(LineCapRound);
         g.DrawArc(&prog, arc.X, arc.Y, arc.Width, arc.Height, 120, (REAL)sweep);
 
         double e = (120.0 + sweep) * PI / 180.0;
-        float ex = KNOB_CX + tr * (float)cos(e);
-        float ey = KNOB_CY + tr * (float)sin(e);
-        SolidBrush halo(Color(64, g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB()));
-        g.FillEllipse(&halo, ex - 12, ey - 12, 24.f, 24.f);
+        float ex = KNOB_CX + trk * (float)cos(e);
+        float ey = KNOB_CY + trk * (float)sin(e);
+        if (g_dark) {
+            SolidBrush halo(Color(90, g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB()));
+            g.FillEllipse(&halo, ex - 15, ey - 15, 30.f, 30.f);
+        }
         SolidBrush dot(g_pal.progDot);
         g.FillEllipse(&dot, ex - 7, ey - 7, 14.f, 14.f);
-        Pen dotEdge(Color(170, 255, 255, 255), 1.4f);
-        g.DrawEllipse(&dotEdge, ex - 7, ey - 7, 14.f, 14.f);
     }
 
-    // 旋钮外盘
-    SolidBrush ringBrush(g_pal.ring);
-    g.FillEllipse(&ringBrush, KNOB_CX - KNOB_R, KNOB_CY - KNOB_R, KNOB_R * 2, KNOB_R * 2);
+    // L2 旋钮环：跨环面线性渐变的斜切厚度 + 外沿倒角 + 内沿倒角
+    {
+        SolidBrush ds(g_pal.raisedSh);
+        g.FillEllipse(&ds, KNOB_CX - RING_O + 2.5f, KNOB_CY - RING_O + 4.5f, RING_O * 2, RING_O * 2);
+        GraphicsPath ring;
+        ring.AddEllipse(KNOB_CX - RING_O, KNOB_CY - RING_O, RING_O * 2, RING_O * 2);
+        ring.AddEllipse(KNOB_CX - RING_I, KNOB_CY - RING_I, RING_I * 2, RING_I * 2);
+        ring.SetFillMode(FillModeAlternate);
+        LinearGradientBrush rg(PointF(KNOB_CX - RING_O, KNOB_CY - RING_O),
+                               PointF(KNOB_CX + RING_O, KNOB_CY + RING_O), g_pal.knob1, g_pal.knob2);
+        g.FillPath(&rg, &ring);
+        Pen oHi(g_pal.raisedHi, 2.4f);
+        g.DrawArc(&oHi, KNOB_CX - RING_O, KNOB_CY - RING_O, RING_O * 2, RING_O * 2, 150, 115);
+        Pen oSh(Color(70, g_pal.raisedSh.GetR(), g_pal.raisedSh.GetG(), g_pal.raisedSh.GetB()), 2.4f);
+        g.DrawArc(&oSh, KNOB_CX - RING_O, KNOB_CY - RING_O, RING_O * 2, RING_O * 2, -40, 115);
+        Pen iSh(Color(90, g_pal.discSh.GetR(), g_pal.discSh.GetG(), g_pal.discSh.GetB()), 3.f);
+        g.DrawArc(&iSh, KNOB_CX - RING_I, KNOB_CY - RING_I, RING_I * 2, RING_I * 2, 150, 115);
+        Pen iHi(Color(80, 255, 255, 255), 2.f);
+        g.DrawArc(&iHi, KNOB_CX - RING_I, KNOB_CY - RING_I, RING_I * 2, RING_I * 2, -40, 115);
+    }
 
-    // 旋钮主体：径向渐变模拟内阴影
-    GraphicsPath knob;
-    knob.AddEllipse(KNOB_CX - KNOB_R * 0.86f, KNOB_CY - KNOB_R * 0.86f,
-                    KNOB_R * 1.72f, KNOB_R * 1.72f);
-    PathGradientBrush pg(&knob);
-    pg.SetCenterPoint(PointF(KNOB_CX, KNOB_CY - KNOB_R * 0.25f));
-    pg.SetCenterColor(g_pal.knob1);
-    int pn = knob.GetPointCount();
-    std::vector<Color> surround((size_t)pn, g_pal.knob2);
-    pg.SetSurroundColors(surround.data(), &pn);
-    g.FillPath(&pg, &knob);
-    Pen edge(g_pal.knobEdge, 1.f);
-    g.DrawPath(&edge, &knob);
+    // L3 中心凹盘：内阴影沉降，中央浮雕图标（浅色浮雕太阳 / 深色琥珀弯月星辰）
+    {
+        SolidBrush db(g_pal.disc);
+        g.FillEllipse(&db, KNOB_CX - RING_I, KNOB_CY - RING_I, RING_I * 2, RING_I * 2);
+        Pen dsh(g_pal.discSh, 4.5f);
+        g.DrawArc(&dsh, KNOB_CX - RING_I + 2, KNOB_CY - RING_I + 2,
+                  (RING_I - 2) * 2, (RING_I - 2) * 2, 150, 115);
+        Pen dhi(Color(90, 255, 255, 255), 2.f);
+        g.DrawArc(&dhi, KNOB_CX - RING_I + 3, KNOB_CY - RING_I + 3,
+                  (RING_I - 3) * 2, (RING_I - 3) * 2, -40, 115);
+        if (g_dark) {
+            SolidBrush gh(Color(40, g_pal.icon.GetR(), g_pal.icon.GetG(), g_pal.icon.GetB()));
+            g.FillEllipse(&gh, KNOB_CX - 46.f, KNOB_CY - 46.f, 92.f, 92.f);
+            DrawMoon(g, KNOB_CX, KNOB_CY, 30.f, g_pal.icon);
+        } else {
+            DrawSun(g, KNOB_CX - 1.8f, KNOB_CY - 1.8f, 30.f, g_pal.iconHi);   // 左上高光刻
+            DrawSun(g, KNOB_CX + 1.8f, KNOB_CY + 1.8f, 30.f, g_pal.discSh);   // 右下暗刻
+            DrawSun(g, KNOB_CX, KNOB_CY, 30.f, g_pal.icon);                   // 浮雕主体
+        }
+    }
 
-    if (g_dark) DrawMoon(g, KNOB_CX, KNOB_CY, 44.f, g_pal.icon);
-    else        DrawSun(g, KNOB_CX, KNOB_CY, 44.f, g_pal.icon);
-
-    // 百分比
+    // 百分比：浅色深蓝 / 深色琥珀（与进度弧同源）
     wchar_t buf[16];
     swprintf(buf, 16, L"%d%%", g_val);
     Font fv(L"Consolas", 46, FontStyleBold, UnitPixel);
-    g.DrawString(buf, -1, &fv, RectF(0, PCT_Y, (float)W, 52), &sf, &tb);
+    SolidBrush pb3(g_pal.prog);
+    g.DrawString(buf, -1, &fv, RectF(0, PCT_Y, (float)W, 52), &sf, &pb3);
 
-    // 胶囊按钮
+    // 胶囊按钮：凸起拟物（落影 + 顶缘高光）
     RectF pill(W / 2.f - PILL_W / 2, PILL_Y, PILL_W, PILL_H);
     GraphicsPath pillPath;
     RoundRect(pillPath, pill, PILL_H / 2);
+    GraphicsPath pillSh;
+    RoundRect(pillSh, RectF(pill.X + 2, pill.Y + 3.5f, pill.Width, pill.Height), PILL_H / 2);
+    SolidBrush pshb(g_pal.raisedSh);
+    g.FillPath(&pshb, &pillSh);
     SolidBrush pb(g_hover == 0 ? g_pal.pillHover : g_pal.pill);
     g.FillPath(&pb, &pillPath);
     Pen pe(g_pal.pillEdge, 1.f);
     g.DrawPath(&pe, &pillPath);
+    Pen phi(g_pal.raisedHi, 1.2f);
+    g.DrawPath(&phi, &pillPath);
 
-    std::wstring full = L"全部显示器";
+    std::wstring full = tr(S_ALLMON);
     if (g_mons.empty()) {
-        full = L"未检测到可控显示器";
+        full = tr(S_NOCTRL);
     } else if (g_sel >= 0 && g_sel < (int)g_mons.size()) {
         full = g_mons[g_sel].name;
     } else {
-        full = L"全部显示器 (" + std::to_wstring(g_mons.size()) + L" 台)";
+        wchar_t b[64];
+        swprintf(b, 64, tr(S_ALLMONFMT), (int)g_mons.size());
+        full = b;
     }
     std::wstring shown = full;
     if (shown.size() > 14) shown = shown.substr(0, 13) + L"…";
@@ -1124,24 +1301,26 @@ static void DrawPanel(Graphics& g, int W, int H) {
     // 提示
     SolidBrush hb(g_pal.hint);
     Font fh(L"Microsoft YaHei UI", 10, FontStyleRegular, UnitPixel);
-    g.DrawString(L"点击切换显示器", -1, &fh, RectF(0, HINT_Y, (float)W, 16), &sf, &hb);
+    g.DrawString(tr(S_HINT), -1, &fh, RectF(0, HINT_Y, (float)W, 16), &sf, &hb);
 
-    // 三个圆形快捷按钮
+    // 三个圆形快捷按钮：凸起拟物（落影 + 双向倒角），激活项图标琥珀/深蓝
     for (int i = 0; i < 3; ++i) {
         float cx = W / 2.f + (i - 1) * BTN_DX;
         bool hot = (g_hover == i + 1);
         float rr = hot ? BTN_R + 1.5f : BTN_R;
 
-        SolidBrush shadow(g_pal.shadow);
-        g.FillEllipse(&shadow, cx - rr, BTN_CY - rr + 2.5f, rr * 2, rr * 2);
+        SolidBrush shadow(g_pal.raisedSh);
+        g.FillEllipse(&shadow, cx - rr + 2, BTN_CY - rr + 3.5f, rr * 2, rr * 2);
 
         LinearGradientBrush lb(PointF(cx, BTN_CY - rr), PointF(cx, BTN_CY + rr),
                                g_pal.btn1, g_pal.btn2);
         g.FillEllipse(&lb, cx - rr, BTN_CY - rr, rr * 2, rr * 2);
-        Pen be(g_pal.pillEdge, 1.f);
-        g.DrawEllipse(&be, cx - rr, BTN_CY - rr, rr * 2, rr * 2);
+        Pen bhi(g_pal.raisedHi, 1.8f);
+        g.DrawArc(&bhi, cx - rr, BTN_CY - rr, rr * 2, rr * 2, 150, 115);
+        Pen bsh(Color(70, g_pal.raisedSh.GetR(), g_pal.raisedSh.GetG(), g_pal.raisedSh.GetB()), 1.8f);
+        g.DrawArc(&bsh, cx - rr, BTN_CY - rr, rr * 2, rr * 2, -40, 115);
 
-        Color ic = (i == 1 && g_cfgAuto) ? g_pal.progDot : g_pal.sub;
+        Color ic = (i == 1 && g_cfgAuto) ? g_pal.prog : g_pal.sub;
         if (i == 0) {
             // 按钮图标反映主题模式：自动=昼夜组合，强制时为太阳/月亮
             if (g_cfgTheme == 0) DrawDayNight(g, cx, BTN_CY, 11.f, ic);
@@ -1155,7 +1334,7 @@ static void DrawPanel(Graphics& g, int W, int H) {
     if (g_fail) {
         SolidBrush rb(g_pal.danger);
         Font fr(L"Microsoft YaHei UI", 9, FontStyleRegular, UnitPixel);
-        g.DrawString(L"写入失败：检查 DDC/CI", -1, &fr, RectF(0, (float)H - 18, (float)W, 14), &sf, &rb);
+        g.DrawString(tr(S_FAIL), -1, &fr, RectF(0, (float)H - 18, (float)W, 14), &sf, &rb);
     }
 
     if (g_menuOpen) DrawMonitorMenu(g, W, H);
@@ -1197,17 +1376,17 @@ static RECT SafeWorkArea(HWND h) {
     APPBARDATA pos{};
     pos.cbSize = sizeof(pos);
     if (SHAppBarMessage(ABM_GETTASKBARPOS, &pos)) {
-        RECT tr = pos.rc;
-        int th = (int)(tr.bottom - tr.top);
-        int tw = (int)(tr.right - tr.left);
+        RECT tb = pos.rc;
+        int th = (int)(tb.bottom - tb.top);
+        int tw = (int)(tb.right - tb.left);
         if (pos.uEdge == ABE_BOTTOM && th > 0 && th < 200)
-            wa.bottom = std::min(wa.bottom, tr.top);
+            wa.bottom = std::min(wa.bottom, tb.top);
         else if (pos.uEdge == ABE_TOP && th > 0 && th < 200)
-            wa.top = std::max(wa.top, tr.bottom);
+            wa.top = std::max(wa.top, tb.bottom);
         else if (pos.uEdge == ABE_LEFT && tw > 0 && tw < 300)
-            wa.left = std::max(wa.left, tr.right);
+            wa.left = std::max(wa.left, tb.right);
         else if (pos.uEdge == ABE_RIGHT && tw > 0 && tw < 300)
-            wa.right = std::min(wa.right, tr.left);
+            wa.right = std::min(wa.right, tb.left);
     }
     return wa;
 }
@@ -1295,7 +1474,7 @@ static void OnOsdPaint(HWND hwnd) {
         cen.SetAlignment(StringAlignmentCenter);
         cen.SetLineAlignment(StringAlignmentCenter);
         g.DrawString(g_osdMode, -1, &fm, RectF(0, 0, 190, 44), &cen, &tb);
-        g.DrawString(L"主题", -1, &fsub, RectF(0, 40, 190, 22), &cen, &sb);
+        g.DrawString(tr(S_THEME), -1, &fsub, RectF(0, 40, 190, 22), &cen, &sb);
         Graphics dst(hdc);
         dst.DrawImage(&buf, 0, 0);
         EndPaint(hwnd, &ps);
@@ -1311,7 +1490,7 @@ static void OnOsdPaint(HWND hwnd) {
     sf.SetLineAlignment(StringAlignmentCenter);
     g.DrawString(buf2, -1, &f, RectF(20, 0, 90, 62), &sf, &tb);
 
-    g.DrawString(L"亮度", -1, &fsub, RectF(88, 0, 80, 62), &sf, &sb);
+    g.DrawString(tr(S_BRIGHTNESS), -1, &fsub, RectF(88, 0, 80, 62), &sf, &sb);
 
     Graphics dst(hdc);
     dst.DrawImage(&buf, 0, 0);
@@ -1381,6 +1560,13 @@ static RectF  SetToggleRect(int i)    { return RectF(SET_R - 44.f, SetRowY(i) - 
 static RectF  SetMinusRect(int i)     { return RectF(236.f, SetRowY(i) - 6.f, 30.f, 30.f); }
 static RectF  SetPlusRect(int i)      { return RectF(334.f, SetRowY(i) - 6.f, 30.f, 30.f); }
 static RectF  SetValueRect(int i)     { return RectF(270.f, SetRowY(i) - 6.f, 60.f, 28.f); }
+// 第 4 行左右各半：左 DDC 间隔，右 步长
+static RectF  SetDdcValue()           { return RectF(110.f, SetRowY(4) - 6.f, 54.f, 28.f); }
+static RectF  SetDdcMinus()           { return RectF(168.f, SetRowY(4) - 6.f, 30.f, 30.f); }
+static RectF  SetDdcPlus()            { return RectF(198.f, SetRowY(4) - 6.f, 30.f, 30.f); }
+static RectF  SetStepValue()          { return RectF(272.f, SetRowY(4) - 6.f, 26.f, 28.f); }
+static RectF  SetStepMinus()          { return RectF(302.f, SetRowY(4) - 6.f, 30.f, 30.f); }
+static RectF  SetStepPlus()           { return RectF(334.f, SetRowY(4) - 6.f, 30.f, 30.f); }
 static RectF  SetEditRect(int i)      { return RectF(SET_R - 72.f, SET_HK + i * SET_HK_STEP, 72.f, 30.f); }
 static RectF  SetKeyRect(int i)       { return RectF(96.f, SET_HK + i * SET_HK_STEP, 190.f, 30.f); }
 static RectF  SetBackRect()           { return RectF(16.f, 8.f, 120.f, 44.f); }
@@ -1416,15 +1602,15 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
     rgt.SetAlignment(StringAlignmentFar);
     rgt.SetLineAlignment(StringAlignmentCenter);
 
-    g.DrawString(L"←  返回", -1, &fb, PointF(28, 18), &sb);
-    g.DrawString(L"设置", -1, &ft, RectF(0, 46, (float)W, 32), &cen, &tb);
+    g.DrawString(tr(S_BACK), -1, &fb, PointF(28, 18), &sb);
+    g.DrawString(tr(S_SETTINGS), -1, &ft, RectF(0, 46, (float)W, 32), &cen, &tb);
 
     Pen sep(g_pal.pillEdge, 1.f);
     g.DrawLine(&sep, SET_L, 96.f, SET_R, 96.f);
 
     wchar_t buf[32];
-    const wchar_t* label[5] = { L"开机自启", L"按时间自动调节", L"开始时间", L"结束时间", L"DDC/CI 间隔" };
-    for (int i = 0; i < 5; ++i) {
+    const wchar_t* label[4] = { tr(S_AUTOSTART), tr(S_AUTOBR), tr(S_STARTH), tr(S_ENDH) };
+    for (int i = 0; i < 4; ++i) {
         bool muted = (i == 2 || i == 3);
         g.DrawString(label[i], -1, &fl, PointF(SET_L, SetRowY(i)), muted ? &sb : &tb);
     }
@@ -1432,23 +1618,35 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
     ToggleTrack(g, SetToggleRect(0).X, SetToggleRect(0).Y, g_cfgStart != 0, g_dark);
     ToggleTrack(g, SetToggleRect(1).X, SetToggleRect(1).Y, g_cfgAuto != 0, g_dark);
 
-    for (int i = 2; i <= 4; ++i) {
-        if (i == 2)      swprintf(buf, 32, L"%02d:00", g_cfgStartH);
-        else if (i == 3) swprintf(buf, 32, L"%02d:00", g_cfgEndH);
-        else             swprintf(buf, 32, L"%d ms", g_cfgDelay);
+    Font fv13(L"Microsoft YaHei UI", 13, FontStyleBold, UnitPixel);
+    for (int i = 2; i <= 3; ++i) {
+        swprintf(buf, 32, L"%02d:00", i == 2 ? g_cfgStartH : g_cfgEndH);
         RectF vr = SetValueRect(i);
         g.DrawString(buf, -1, &fv, vr, &rgt, &tb);
         RectF mr = SetMinusRect(i), pr = SetPlusRect(i);
         MiniButton(g, mr.X, mr.Y, false);
         MiniButton(g, pr.X, pr.Y, true);
     }
+    // 第 4 行：左 DDC 间隔 / 右 步长
+    g.DrawString(tr(S_DDC), -1, &fl, PointF(SET_L, SetRowY(4)), &tb);
+    swprintf(buf, 32, L"%d ms", g_cfgDelay);
+    g.DrawString(buf, -1, &fv13, SetDdcValue(), &rgt, &tb);
+    RectF dm = SetDdcMinus(), dp = SetDdcPlus();
+    MiniButton(g, dm.X, dm.Y, false);
+    MiniButton(g, dp.X, dp.Y, true);
+    g.DrawString(tr(S_STEP), -1, &fl, PointF(240.f, SetRowY(4)), &tb);
+    swprintf(buf, 32, L"%d", g_step);
+    g.DrawString(buf, -1, &fv13, SetStepValue(), &rgt, &tb);
+    RectF sm = SetStepMinus(), sp = SetStepPlus();
+    MiniButton(g, sm.X, sm.Y, false);
+    MiniButton(g, sp.X, sp.Y, true);
 
     g.DrawLine(&sep, SET_L, 356.f, SET_R, 356.f);
-    g.DrawString(L"全局快捷键", -1, &fsec, PointF(SET_L, 368), &tb);
+    g.DrawString(tr(S_HOTKEYS), -1, &fsec, PointF(SET_L, 368), &tb);
 
     for (int i = 0; i < 3; ++i) {
         float y = SET_HK + i * SET_HK_STEP;
-        g.DrawString(i == 0 ? L"上调" : i == 1 ? L"下调" : L"呼出面板", -1, &fl, PointF(SET_L, y + 6), &tb);
+        g.DrawString(i == 0 ? tr(S_UP) : i == 1 ? tr(S_DOWN) : tr(S_SHOWPILL), -1, &fl, PointF(SET_L, y + 6), &tb);
 
         RectF kr = SetKeyRect(i);
         GraphicsPath kp;
@@ -1461,7 +1659,7 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
         UINT hm = (i == 0) ? g_hkUpMod : (i == 1) ? g_hkDownMod : g_hkShowMod;
         UINT hv = (i == 0) ? g_hkUpVk  : (i == 1) ? g_hkDownVk  : g_hkShowVk;
         std::wstring txt;
-        if (g_capSlot == i + 1) txt = L"按下 Ctrl 或 Alt + 键…";
+        if (g_capSlot == i + 1) txt = tr(S_PRESSKEY);
         else txt = HotkeyText(hm, hv);
         SolidBrush& tc = (g_capSlot == i + 1) ? acc : sb;
         Font& kf = (g_capSlot == i + 1) ? fs : fl;
@@ -1474,18 +1672,18 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
         g.FillPath(&eb, &ep);
         Pen epn(g_pal.pillEdge, 1.f);
         g.DrawPath(&epn, &ep);
-        g.DrawString(g_capSlot == i + 1 ? L"取消" : L"修改", -1, &fs, er, &cen, &tb);
+        g.DrawString(g_capSlot == i + 1 ? tr(S_CANCEL) : tr(S_MODIFY), -1, &fs, er, &cen, &tb);
     }
 
     SolidBrush eb(g_pal.danger);
     SolidBrush* msgBrush = &sb;
-    const wchar_t* msg = L"lumen · DDC/CI + WMI 混合控制";
+    const wchar_t* msg = tr(S_SIG);
     if (g_hkMsg == 1) {
-        msg = L"该组合已被其他程序占用，保留原快捷键"; msgBrush = &eb;
+        msg = tr(S_OCCUPIED); msgBrush = &eb;
     } else if (g_hkMsg == 2) {
-        msg = L"需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑"; msgBrush = &eb;
+        msg = tr(S_NEEDMOD); msgBrush = &eb;
     } else if (g_capSlot) {
-        msg = L"组合需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑";
+        msg = tr(S_NEEDMOD);
     }
     g.DrawString(msg, -1, &fs, PointF(SET_L, H - 40.f), msgBrush);
 }
@@ -1634,14 +1832,16 @@ static void DrawMonitorMenu(Graphics& g, int W, int H) {
 
         std::wstring label;
         if (i == 0) {
-            label = L"全部显示器 (" + std::to_wstring(g_mons.size()) + L" 台)";
+            wchar_t b[64];
+            swprintf(b, 64, tr(S_ALLMONFMT), (int)g_mons.size());
+            label = b;
         } else {
             const Mon& m = g_mons[i - 1];
             label = m.name;
-            if (m.wmi)            label += L" (内置)";
-            else if (m.primary)   label += L" (主显示器)";
-            else                  label += L" (副屏)";
-            if (!m.controllable)  label += L" · 不可调";
+            if (m.wmi)            label += tr(S_BUILTIN);
+            else if (m.primary)   label += tr(S_PRIMARY);
+            else                  label += tr(S_EXTERNAL);
+            if (!m.controllable)  label += tr(S_NOADJ);
         }
 
         // 勾选对号
@@ -1677,7 +1877,7 @@ static void OnQuickAction(int idx) {
         RegPut(L"ThemeMode", g_cfgTheme);
         LoadTheme();
         AddTray();
-        ShowOsdMode(g_cfgTheme == 0 ? L"自动" : (g_dark ? L"深色" : L"浅色"));
+        ShowOsdMode(g_cfgTheme == 0 ? tr(S_AUTO) : (g_dark ? tr(S_DARK) : tr(S_LIGHT)));
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
     } else if (idx == 2) {
         g_cfgAuto = g_cfgAuto ? 0 : 1;
@@ -1773,7 +1973,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            for (int i = 2; i <= 4; ++i) {
+            for (int i = 2; i <= 3; ++i) {
                 bool minus = InRect(SetMinusRect(i), x, y);
                 bool plus  = InRect(SetPlusRect(i), x, y);
                 if (!minus && !plus) continue;
@@ -1782,15 +1982,29 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_cfgEndH <= g_cfgStartH) g_cfgEndH = std::min(23, g_cfgStartH + 1);
                     RegPut(L"AutoStartH", g_cfgStartH);
                     RegPut(L"AutoEndH", g_cfgEndH);
-                } else if (i == 3) {
+                } else {
                     g_cfgEndH = plus ? std::min(23, g_cfgEndH + 1)
                                      : std::max(g_cfgStartH + 1, g_cfgEndH - 1);
                     RegPut(L"AutoEndH", g_cfgEndH);
-                } else {
-                    g_cfgDelay = plus ? std::min(200, g_cfgDelay + 5)
-                                      : std::max(10, g_cfgDelay - 5);
-                    RegPut(L"DdcDelay", g_cfgDelay);
                 }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (InRect(SetDdcMinus(), x, y) || InRect(SetDdcPlus(), x, y)) {
+                bool plus = InRect(SetDdcPlus(), x, y);
+                g_cfgDelay = plus ? std::min(200, g_cfgDelay + 5)
+                                  : std::max(10, g_cfgDelay - 5);
+                RegPut(L"DdcDelay", g_cfgDelay);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (InRect(SetStepMinus(), x, y) || InRect(SetStepPlus(), x, y)) {
+                static const int steps[4] = { 1, 2, 5, 10 };
+                int i = 0;
+                while (i < 3 && steps[i] != g_step) ++i;
+                i = InRect(SetStepPlus(), x, y) ? std::min(3, i + 1) : std::max(0, i - 1);
+                g_step = steps[i];
+                RegPut(L"Step", g_step);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
@@ -1827,7 +2041,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEWHEEL:
         if (g_page == 1 || g_capSlot || g_menuOpen) return 0;
-        Post(g_val + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 5 : -5));
+        Post(g_val + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? g_step : -g_step));
         return 0;
 
     case WM_KEYDOWN:
@@ -1918,14 +2132,22 @@ static HICON MakeIcon(int size) {
     Graphics g(&bmp);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.Clear(Color(0, 0, 0, 0));
-    float c = size / 2.f, r = size * 0.46f;
-    SolidBrush bg(g_dark ? Color(255, 22, 33, 47) : Color(255, 255, 255, 255));
-    g.FillEllipse(&bg, c - r, c - r, r * 2, r * 2);
+    // 徽章风格（与 exe 图标参考图纸同源）：圆角方形 + 主题感知配色
+    float s = (float)size, inset = s * 0.05f, w = s - inset * 2;
+    GraphicsPath badge;
+    RoundRect(badge, RectF(inset, inset, w, w), w * 0.28f);
+    LinearGradientBrush bg(PointF(0, inset), PointF(0, inset + w),
+        g_dark ? Color(255, 38, 51, 74) : Color(255, 252, 253, 255),
+        g_dark ? Color(255, 19, 29, 44) : Color(255, 224, 231, 243));
+    g.FillPath(&bg, &badge);
+    Pen rim(g_dark ? Color(255, 58, 74, 102) : Color(255, 202, 212, 228), s * 0.03f);
+    g.DrawPath(&rim, &badge);
+    float c = size / 2.f;
     if (g_cfgTheme == 0)                       // 跟随系统：昼夜组合图标
-        DrawDayNight(g, c, c, size * 0.36f, g_dark ? Color(255, 232, 192, 122)
+        DrawDayNight(g, c, c, size * 0.30f, g_dark ? Color(255, 232, 192, 122)
                                                    : Color(255, 122, 150, 186));
-    else if (g_dark) DrawMoon(g, c, c, size * 0.26f, Color(255, 232, 192, 122));
-    else             DrawSun(g, c, c, size * 0.26f, Color(255, 122, 150, 186));
+    else if (g_dark) DrawMoon(g, c, c, size * 0.24f, Color(255, 232, 192, 122));
+    else             DrawSun(g, c, c, size * 0.24f, Color(255, 122, 150, 186));
 
     HBITMAP hb = nullptr;
     bmp.GetHBITMAP(Color(0, 0, 0, 0), &hb);
@@ -2001,14 +2223,22 @@ static void ShowMenu() {
     POINT pt;
     GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, 1, L"显示面板");
+    AppendMenuW(m, MF_STRING, 1, tr(S_SHOWPANEL));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, 2, L"亮度 +10");
-    AppendMenuW(m, MF_STRING, 3, L"亮度 -10");
+    AppendMenuW(m, MF_STRING, 2, tr(S_BRIGHTUP));
+    AppendMenuW(m, MF_STRING, 3, tr(S_BRIGHTDN));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, 5, L"设置");
+    HMENU lm = CreatePopupMenu();
+    int cur = RegGet(L"Lang", 0);
+    AppendMenuW(lm, MF_STRING | (cur == 0 ? MF_CHECKED : 0), 10, tr(S_AUTO));
+    AppendMenuW(lm, MF_STRING | (cur == 1 ? MF_CHECKED : 0), 11, L"中文");
+    AppendMenuW(lm, MF_STRING | (cur == 2 ? MF_CHECKED : 0), 12, L"English");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)lm, tr(S_LANG));
+    AppendMenuW(m, MF_STRING, 6, tr(S_DIAG));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_EXIT, L"退出 lumen");
+    AppendMenuW(m, MF_STRING, 5, tr(S_SETTINGS));
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, ID_EXIT, tr(S_EXIT));
     SetForegroundWindow(g_msg);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_msg, nullptr);
     DestroyMenu(m);
@@ -2016,12 +2246,116 @@ static void ShowMenu() {
     if (cmd == 1) ShowPanel();
     else if (cmd == 2) { Adjust(10); ShowOsd(); }
     else if (cmd == 3) { Adjust(-10); ShowOsd(); }
+    else if (cmd == 6) CopyDiagnostics();
+    else if (cmd == 10 || cmd == 11 || cmd == 12) {
+        RegPut(L"Lang", cmd - 10);
+        ApplyLang();
+    }
     else if (cmd == 5) {
         ShowPanel();
         g_page = 1;
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
     }
     else if (cmd == ID_EXIT) PostMessageW(g_msg, WM_CLOSE, 0, 0);
+}
+
+// ---------------------------------------------------------------- 检查更新（启动后台静默查一次 GitHub Releases）
+
+// Mimosa 约束：仅 https；host 白名单；解析出的 IP 拒绝环回/私有/链路本地等保留地址
+static bool HostIsPublic(const wchar_t* host) {
+    ADDRINFOW* ai = nullptr;
+    ADDRINFOW hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (GetAddrInfoW(host, L"443", &hints, &ai) != 0) return false;
+    bool ok = ai != nullptr;
+    for (ADDRINFOW* p = ai; p && ok; p = p->ai_next) {
+        wchar_t ip[128] = L"";
+        DWORD len = 128;
+        if (WSAAddressToStringW(p->ai_addr, (DWORD)p->ai_addrlen, nullptr, ip, &len) != 0) continue;
+        if (wcsncmp(ip, L"127.", 4) == 0 || wcsncmp(ip, L"10.", 3) == 0 ||
+            wcsncmp(ip, L"192.168.", 8) == 0 || wcsncmp(ip, L"169.254.", 8) == 0 ||
+            wcsncmp(ip, L"0.", 2) == 0)
+            ok = false;
+        if (ok && wcsncmp(ip, L"172.", 4) == 0) {
+            int o2 = _wtoi(ip + 4);
+            if (o2 >= 16 && o2 <= 31) ok = false;
+        }
+        if (ok && p->ai_family == AF_INET6) {
+            if (wcsncmp(ip, L"::1", 3) == 0 || wcsncmp(ip, L"fc", 2) == 0 ||
+                wcsncmp(ip, L"fd", 2) == 0 || wcsncmp(ip, L"fe80", 4) == 0)
+                ok = false;
+        }
+    }
+    FreeAddrInfoW(ai);
+    return ok;
+}
+
+static bool TagNewer(const wchar_t* tag) {
+    int a1 = 0, a2 = 0, a3 = 0, b1 = 0, b2 = 0, b3 = 0;
+    swscanf(APP_VERSION, L"%d.%d.%d", &a1, &a2, &a3);
+    if (swscanf(tag, L"v%d.%d.%d", &b1, &b2, &b3) != 3 &&
+        swscanf(tag, L"%d.%d.%d", &b1, &b2, &b3) != 3) return false;
+    if (b1 != a1) return b1 > a1;
+    if (b2 != a2) return b2 > a2;
+    return b3 > a3;
+}
+
+static DWORD WINAPI CheckUpdateTh(LPVOID) {
+    Sleep(8000);
+    URL_COMPONENTSW uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[64] = L"", path[256] = L"";
+    uc.lpszHostName = host;  uc.dwHostNameLength = 63;
+    uc.lpszUrlPath = path;   uc.dwUrlPathLength = 255;
+    if (!WinHttpCrackUrl(L"https://api.github.com/repos/iosvcnm/lumen/releases/latest", 0, 0, &uc))
+        return 0;
+    if (wcscmp(host, L"api.github.com") != 0 || !HostIsPublic(host)) return 0;
+
+    HINTERNET ses = WinHttpOpen(L"lumen-update-check", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) return 0;
+    WinHttpSetTimeouts(ses, 5000, 5000, 5000, 5000);
+    HINTERNET con = WinHttpConnect(ses, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET req = con ? WinHttpOpenRequest(con, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                             WINHTTP_FLAG_SECURE) : nullptr;
+    std::string body;
+    if (req && WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(req, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        if (status == 200) {
+            for (;;) {
+                DWORD rd = 0;
+                char buf[4096];
+                if (!WinHttpReadData(req, buf, sizeof(buf), &rd) || rd == 0) break;
+                body.append(buf, rd);
+                if (body.size() > 1 << 20) break;
+            }
+        }
+    }
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+
+    size_t p = body.find("\"tag_name\":\"v");
+    if (p == std::string::npos) p = body.find("\"tag_name\":\"");
+    if (p == std::string::npos) return 0;
+    p += strlen("\"tag_name\":\"");
+    size_t e = body.find('"', p);
+    if (e == std::string::npos || e - p > 31) return 0;
+    std::string tag = body.substr(p, e - p);
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, tag.c_str(), -1, nullptr, 0);
+    if (wlen <= 0 || wlen > 32) return 0;
+    wchar_t* wtag = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+    if (!wtag) return 0;
+    MultiByteToWideChar(CP_UTF8, 0, tag.c_str(), -1, wtag, wlen);
+    if (TagNewer(wtag)) PostMessageW(g_msg, WM_UPDATE, (WPARAM)wtag, 0);
+    else free(wtag);
+    return 0;
 }
 
 // ---------------------------------------------------------------- 主消息窗口
@@ -2065,7 +2399,7 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UINT tmsg = (UINT)LOWORD(lp);
         if (tmsg == WM_MOUSEWHEEL) {          // 托盘图标上滚轮：直接调亮度
             short d = (short)HIWORD(wp);
-            if (d) { Post(g_val + (d > 0 ? 5 : -5)); ShowOsd(); }
+            if (d) { Post(g_val + (d > 0 ? g_step : -g_step)); ShowOsd(); }
             return 0;
         }
         if (tmsg == WM_LBUTTONUP) TogglePanel();
@@ -2074,8 +2408,8 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_HOTKEY:
-        if (wp == HK_UP) { Adjust(5); ShowOsd(); }
-        else if (wp == HK_DOWN) { Adjust(-5); ShowOsd(); }
+        if (wp == HK_UP) { Adjust(g_step); ShowOsd(); }
+        else if (wp == HK_DOWN) { Adjust(-g_step); ShowOsd(); }
         else if (wp == HK_TOGGLE) TogglePanel();
         return 0;
 
@@ -2098,12 +2432,29 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
         return 0;
 
+    case WM_UPDATE: {
+        wchar_t* tag = (wchar_t*)wp;
+        if (g_tray && tag) {
+            wchar_t info[256];
+            swprintf(info, 256, tr(S_UPDATEFMT), tag);
+            g_nid.uFlags |= NIF_INFO;
+            wcsncpy(g_nid.szInfo, info, 255); g_nid.szInfo[255] = 0;
+            wcsncpy(g_nid.szInfoTitle, L"lumen", 63); g_nid.szInfoTitle[63] = 0;
+            g_nid.dwInfoFlags = NIIF_INFO;
+            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+            g_nid.uFlags &= ~NIF_INFO;
+        }
+        free(tag);
+        return 0;
+    }
+
     case WM_DISPLAYCHANGE:
     case WM_POWERBROADCAST:
         g_namesDone = false;
         g_mons = Scan();
         ApplyNames(g_mons);
         MatchSavedSelection();
+        RestoreBrightness();
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
         return TRUE;
 
@@ -2123,6 +2474,19 @@ static void RegisterClasses() {
     c.lpfnWndProc = MsgProc;
     c.lpszClassName = kMsgClass;
     RegisterClassExW(&c);
+
+    // 广播转发窗口：message-only 收不到系统广播，用顶层隐藏窗口转发给 g_msg
+    WNDCLASSW bc{};
+    bc.lpfnWndProc = [](HWND h, UINT m, WPARAM wp, LPARAM lp) -> LRESULT {
+        if (m == WM_DISPLAYCHANGE || m == WM_POWERBROADCAST) {
+            if (g_msg) PostMessageW(g_msg, m, wp, lp);
+            return 0;
+        }
+        return DefWindowProcW(h, m, wp, lp);
+    };
+    bc.hInstance = g_inst;
+    bc.lpszClassName = kBcastClass;
+    RegisterClassW(&bc);
 
     c.lpfnWndProc = PanelProc;
     c.lpszClassName = kPanelClass;
@@ -2169,8 +2533,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     RegisterClasses();
 
     g_msg = CreateWindowExW(0, kMsgClass, L"", 0, 0, 0, 0, 0,
-                            HWND_MESSAGE, nullptr, hInst, nullptr);
+                            HWND_MESSAGE, nullptr, hInst, nullptr);   // message-only：热键/托盘宿主
     if (!g_msg) return 1;
+    CreateWindowExW(WS_EX_TOOLWINDOW, kBcastClass, L"", WS_POPUP, 0, 0, 0, 0,
+                    nullptr, nullptr, hInst, nullptr);   // 隐藏顶层：接收 WM_POWERBROADCAST / WM_DISPLAYCHANGE
 
     AddTray();
     RegisterHotkeys();
@@ -2180,13 +2546,23 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
                                 nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     g_writer.Start();
+    g_mons = Scan();
+    ApplyNames(g_mons);
+    RestoreBrightness();          // 重启后恢复每台屏的上次亮度
     ApplyAutoBrightness();
+    CloseHandle(CreateThread(nullptr, 0, CheckUpdateTh, nullptr, 0, nullptr));
 
-    // --show：启动后直接展开面板；--settings：直接展开设置页
+    // --show：启动后直接展开面板；--settings：直接进设置页；--diag：复制诊断信息后退出
     if (wcsstr(GetCommandLineW(), L"--show")) PostMessageW(g_msg, WM_SHOW, 0, 0);
     if (wcsstr(GetCommandLineW(), L"--settings")) {
         g_wantSettings = true;
         PostMessageW(g_msg, WM_SHOW, 0, 0);
+    }
+    if (wcsstr(GetCommandLineW(), L"--diag")) {
+        g_mons = Scan();
+        ApplyNames(g_mons);
+        CopyDiagnostics();
+        PostQuitMessage(0);
     }
 
     MSG m;

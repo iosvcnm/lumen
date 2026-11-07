@@ -24,16 +24,66 @@ static void DrawSun(Graphics& g, float cx, float cy, float r, Color c) {
     }
 }
 
+// 参考图纸：圆角方形徽章 + 内圈刻度点 + 旋钮 + 中心太阳（浅色变体）
 static bool PngBytes(int size, std::vector<BYTE>& out) {
     Bitmap bmp(size, size, PixelFormat32bppARGB);
     Graphics g(&bmp);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.Clear(Color(0, 0, 0, 0));
 
-    float c = size / 2.f, r = size * 0.46f;
-    SolidBrush bg(Color(255, 243, 247, 252));
-    g.FillEllipse(&bg, c - r, c - r, r * 2, r * 2);
-    DrawSun(g, c, c, size * 0.30f, Color(255, 122, 150, 186));
+    float s = (float)size;
+    float inset = s * 0.035f, w = s - inset * 2, rad = s * 0.205f;
+    GraphicsPath badge;
+    badge.AddArc(inset, inset, rad * 2, rad * 2, 180, 90);
+    badge.AddArc(inset + w - rad * 2, inset, rad * 2, rad * 2, 270, 90);
+    badge.AddArc(inset + w - rad * 2, inset + w - rad * 2, rad * 2, rad * 2, 0, 90);
+    badge.AddArc(inset, inset + w - rad * 2, rad * 2, rad * 2, 90, 90);
+    badge.CloseFigure();
+    LinearGradientBrush bg(PointF(0, inset), PointF(0, inset + w),
+                           Color(255, 252, 253, 255), Color(255, 224, 231, 243));
+    g.FillPath(&bg, &badge);
+    Pen rim(Color(255, 202, 212, 228), s * 0.016f);
+    g.DrawPath(&rim, &badge);
+    // 徽章内沿一圈更浅的描边，呈现凸起层次
+    GraphicsPath inner;
+    float i2 = s * 0.075f;
+    inner.AddArc(i2, i2, s * 0.17f, s * 0.17f, 180, 90);
+    inner.AddArc(s - i2 - s * 0.17f, i2, s * 0.17f, s * 0.17f, 270, 90);
+    inner.AddArc(s - i2 - s * 0.17f, s - i2 - s * 0.17f, s * 0.17f, s * 0.17f, 0, 90);
+    inner.AddArc(i2, s - i2 - s * 0.17f, s * 0.17f, s * 0.17f, 90, 90);
+    inner.CloseFigure();
+    Pen irim(Color(255, 214, 222, 236), s * 0.012f);
+    g.DrawPath(&irim, &inner);
+
+    // 刻度点环：14 点、300° 弧，顶部 3 点着色
+    float c = s / 2.f;
+    if (size >= 24) {
+        for (int i = 0; i < 14; ++i) {
+            double a = (-240.0 + i * (300.0 / 13.0)) * PI / 180.0;
+            float dx = (float)cos(a), dy = (float)sin(a);
+            float rr = s * 0.265f, dr = s * 0.021f;
+            Color col = (i >= 6 && i <= 8) ? Color(255, 120, 150, 190)
+                                           : Color(255, 176, 188, 208);
+            SolidBrush db(col);
+            g.FillEllipse(&db, c + dx * rr - dr, c + dy * rr - dr, dr * 2, dr * 2);
+        }
+    }
+
+    // 旋钮：径向渐变凸盘 + 细描边
+    float kr = s * 0.185f;
+    GraphicsPath knob;
+    knob.AddEllipse(c - kr, c - kr, kr * 2, kr * 2);
+    PathGradientBrush kg(&knob);
+    kg.SetCenterColor(Color(255, 250, 252, 255));
+    kg.SetCenterPoint(PointF(c - kr * 0.25f, c - kr * 0.3f));
+    Color surr(Color(255, 216, 224, 238));
+    INT n = 1;
+    kg.SetSurroundColors(&surr, &n);
+    g.FillPath(&kg, &knob);
+    Pen ke(Color(255, 196, 206, 224), s * 0.014f);
+    g.DrawPath(&ke, &knob);
+
+    DrawSun(g, c, c, s * 0.105f, Color(255, 122, 150, 186));
 
     CLSID png;
     if (CLSIDFromString(L"{557CF406-1A04-11D3-9A73-0000F81EF32E}", &png) != S_OK) return false;
