@@ -92,6 +92,7 @@ struct Mon {
     bool controllable = false;
     bool primary = false;
     bool wmi = false;
+    bool hdr = false;      // Windows 高级色 HDR 激活（OSD 硬件 HDR 检测不到）
     int  pct = 50;
     DWORD mn = 0, mx = 100;
 };
@@ -129,15 +130,16 @@ static const float UI_SCALE = 0.86f;
 
 // ---------------------------------------------------------------- 多语言（0 跟随系统 / 1 中文 / 2 English）
 static int g_lang = 0;
-static int g_step = 5;   // 滚轮/热键步长，可调 1/2/5/10
+static int g_step = 5;       // 滚轮/热键步长，可调 1/2/5/10
+static int g_gammaDim = 0;   // 软件调光：HDR 固件锁 DDC 亮度时的 gamma 回退通路
 enum {
     S_BRIGHTNESS, S_THEME, S_AUTO, S_LIGHT, S_DARK,
     S_ALLMON, S_NOCTRL, S_ALLMONFMT, S_BUILTIN, S_PRIMARY, S_EXTERNAL, S_NOADJ,
     S_BUILTINSCR, S_GENERICFMT,
     S_HINT, S_FAIL, S_BACK, S_SETTINGS, S_AUTOSTART, S_AUTOBR, S_STARTH, S_ENDH, S_DDC, S_STEP,
     S_HOTKEYS, S_UP, S_DOWN, S_SHOWPILL, S_PRESSKEY, S_OCCUPIED, S_NEEDMOD, S_MODIFY, S_CANCEL, S_SIG,
-    S_SHOWPANEL, S_BRIGHTUP, S_BRIGHTDN, S_DIAG, S_EXIT, S_LANG,
-    S_OCCUPFMT, S_UPDATEFMT,
+    S_SHOWPANEL, S_BRIGHTUP, S_BRIGHTDN, S_DIAG, S_EXIT, S_LANG, S_GAMMA,
+    S_OCCUPFMT, S_UPDATEFMT, S_HDR,
     S_COUNT
 };
 static const wchar_t* const STR_CN[S_COUNT] = {
@@ -150,7 +152,9 @@ static const wchar_t* const STR_CN[S_COUNT] = {
     L"需包含 Ctrl 或 Alt，例如 Ctrl+Alt+↑", L"修改", L"取消",
     L"lumen · DDC/CI + WMI 混合控制",
     L"显示面板", L"亮度 +10", L"亮度 -10", L"复制诊断信息", L"退出 lumen", L"语言",
+    L"软件调光（HDR 显示器用）",
     L"%ls %ls：组合被占用", L"lumen 有新版本 %ls\nhttps://github.com/iosvcnm/lumen/releases/latest",
+    L" · HDR",
 };
 static const wchar_t* const STR_EN[S_COUNT] = {
     L"Brightness", L"Theme", L"Auto", L"Light", L"Dark",
@@ -162,7 +166,9 @@ static const wchar_t* const STR_EN[S_COUNT] = {
     L"Needs Ctrl or Alt, e.g. Ctrl+Alt+Up", L"Edit", L"Cancel",
     L"lumen · DDC/CI + WMI hybrid control",
     L"Show panel", L"Brightness +10", L"Brightness -10", L"Copy diagnostics", L"Exit lumen", L"Language",
+    L"Software dimming (for HDR monitors)",
     L"%ls %ls: combo occupied", L"lumen %ls is available\nhttps://github.com/iosvcnm/lumen/releases/latest",
+    L" · HDR",
 };
 static const wchar_t* tr(int id) { return (g_lang == 2) ? STR_EN[id] : STR_CN[id]; }
 static int RegGet(const wchar_t* name, int def);   // 定义在配置区，ApplyLang 先用
@@ -236,6 +242,7 @@ static void LoadConfig() {
     g_hkShowMod = (UINT)RegGet(L"HotShowMod", MOD_CONTROL | MOD_ALT);
     g_hkShowVk  = (UINT)RegGet(L"HotShowVk", 'B');
     g_cfgSel    = RegGetStr(L"SelMonitor", L"");
+    g_gammaDim = RegGet(L"GammaDim", 0);
     int st = RegGet(L"Step", 5);
     g_step = (st == 1 || st == 2 || st == 5 || st == 10) ? st : 5;
     ApplyLang();
@@ -695,6 +702,8 @@ static std::wstring MonitorKey(const wchar_t* dev) {
     return dev;
 }
 
+static bool RefreshHdrFlags(std::vector<Mon>& mons);   // 定义在 HDR 段，Scan 末尾调用
+
 static std::vector<Mon> Scan() {
     std::vector<HMONITOR> hs;
     EnumDisplayMonitors(nullptr, nullptr, MonEnum, (LPARAM)&hs);
@@ -725,6 +734,12 @@ static std::vector<Mon> Scan() {
             m.mn = mn; m.mx = mx;
             if (!ok) continue;
             m.pct = (int)((cur - mn) * 100u / (mx - mn));
+            if (g_gammaDim) {
+                // 软件调光模式：DDC 寄存器被 HDR 固件锁在自身 SDR 值，回读无意义——
+                // 初始百分比改用 lumen 自己的记忆（Last_<key>），与 ApplyGammaDim 的写入同源
+                m.pct = RegGet((L"Last_" + m.key).c_str(), m.pct);
+                if (m.pct < 0 || m.pct > 100) m.pct = 50;
+            }
             out.push_back(m);
         }
     }
@@ -740,6 +755,7 @@ static std::vector<Mon> Scan() {
         m.pct = std::min(100, wv);
         out.push_back(m);
     }
+    RefreshHdrFlags(out);
     return out;
 }
 
@@ -768,7 +784,66 @@ static bool WriteWmiCim(int pct) {
     return code == 0;
 }
 
+// ---- 软件调光（gamma ramp）：显示器固件在 HDR 下锁死 DDC/CI 亮度时的回退通路 ----
+// 基准恒等 ramp 直接合成（Windows 默认状态），恢复=写恒等；不捕获当前值，
+// 避免进程被强杀后把"已调暗的 ramp"当成基准造成永久变暗。
+
+static HDC DcForDev(const std::wstring& dev) {
+    std::vector<HMONITOR> hs;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM lp) {
+        ((std::vector<HMONITOR>*)lp)->push_back(h); return TRUE;
+    }, (LPARAM)&hs);
+    for (HMONITOR h : hs) {
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(h, (MONITORINFO*)&mi)) continue;
+        if (dev == mi.szDevice) return CreateDCW(mi.szDevice, mi.szDevice, nullptr, nullptr);
+    }
+    return nullptr;
+}
+
+static void WriteRamp(HDC dc, float scale) {
+    WORD r[3][256];
+    for (int i = 0; i < 256; ++i) {
+        WORD v = (WORD)std::min(65535L, (long)i * 257);
+        if (scale < 1.f) v = (WORD)(v * scale);
+        r[0][i] = r[1][i] = r[2][i] = v;
+    }
+    SetDeviceGammaRamp(dc, r);
+}
+
+static bool ApplyGammaDim(const std::wstring& dev, int pct) {
+    HDC dc = DcForDev(dev);
+    if (!dc) return false;
+    // Windows 安全限制：ramp 线性缩放低于 ~50% 会被 SetDeviceGammaRamp 拒绝（实测 0.5 过 / 0.4 拒）
+    float scale = 0.5f + 0.5f * std::max(0, std::min(100, pct)) / 100.f;
+    WriteRamp(dc, scale);
+    DeleteDC(dc);
+    return true;
+}
+
+static void ResetGammaAll() {
+    std::vector<HMONITOR> hs;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM lp) {
+        ((std::vector<HMONITOR>*)lp)->push_back(h); return TRUE;
+    }, (LPARAM)&hs);
+    for (HMONITOR h : hs) {
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(h, (MONITORINFO*)&mi)) continue;
+        HDC dc = CreateDCW(mi.szDevice, mi.szDevice, nullptr, nullptr);
+        if (!dc) continue;
+        WriteRamp(dc, 1.f);      // 恒等 ramp = Windows 默认状态
+        DeleteDC(dc);
+    }
+}
+
 static bool WriteOne(const std::wstring& dev, int pct, unsigned delayMs) {
+    if (g_gammaDim && dev != L"WMI") {          // 软件调光：gamma 缩放替代 DDC（HDR 固件锁亮度时用）
+        bool ok = ApplyGammaDim(dev, pct);
+        if (delayMs) Sleep(delayMs);
+        return ok;
+    }
     if (dev == L"WMI") {
         bool ok = WriteWmiCim(pct);
         if (delayMs) Sleep(delayMs);
@@ -800,6 +875,68 @@ static bool WriteOne(const std::wstring& dev, int pct, unsigned delayMs) {
         return any;
     }
     return false;
+}
+
+// ---------------------------------------------------------------- HDR 状态（Windows 高级色）
+
+#ifndef DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2
+#define DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2 15
+#endif
+
+struct DciAci2 {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    UINT32 value;                 // advancedColorActive = bit1
+    UINT32 colorEncoding;
+    UINT32 bitsPerColorChannel;
+    UINT32 activeColorMode;       // 0 SDR / 1 WCG / 2 HDR
+};
+
+// 刷新每台屏的 HDR 激活标志；返回是否有变化（供轮询决定是否重绘）
+// 注意：高级色查询必须用路径的 targetInfo（source id 会返回 ERROR_GEN_FAILURE）
+static bool RefreshHdrFlags(std::vector<Mon>& mons) {
+    UINT32 nPath = 0, nMode = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPath, &nMode) != ERROR_SUCCESS)
+        return false;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPath);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nMode);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPath, paths.data(), &nMode,
+                           modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+    std::map<std::wstring, bool> hdrOf;
+    for (UINT32 i = 0; i < nPath; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+        src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size = sizeof(src);
+        src.header.adapterId = paths[i].sourceInfo.adapterId;
+        src.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS) continue;
+
+        DciAci2 a{};
+        a.header.type = (DISPLAYCONFIG_DEVICE_INFO_TYPE)DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+        a.header.size = sizeof(a);
+        a.header.adapterId = paths[i].targetInfo.adapterId;
+        a.header.id = paths[i].targetInfo.id;
+        bool hdr = false;
+        if (DisplayConfigGetDeviceInfo(&a.header) == ERROR_SUCCESS) {
+            hdr = (a.value & 2) != 0 || a.activeColorMode == 2;
+        } else {
+            DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO b{};
+            b.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+            b.header.size = sizeof(b);
+            b.header.adapterId = paths[i].targetInfo.adapterId;
+            b.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&b.header) == ERROR_SUCCESS)
+                hdr = (b.value & 2) != 0;   // advancedColorEnabled
+        }
+        hdrOf[src.viewGdiDeviceName] = hdr;
+    }
+    bool changed = false;
+    for (auto& m : mons) {
+        auto it = hdrOf.find(m.dev);
+        bool now = (it != hdrOf.end()) && it->second;
+        if (now != m.hdr) { m.hdr = now; changed = true; }
+    }
+    return changed;
 }
 
 // ---------------------------------------------------------------- 显示器名称（EDID）
@@ -939,7 +1076,14 @@ static void RestoreBrightness() {
     for (auto& m : g_mons) {
         if (!m.controllable) continue;
         int last = RegGet((L"Last_" + m.key).c_str(), -1);
-        if (last < 0 || last > 100 || last == m.pct) continue;
+        if (last < 0 || last > 100) continue;
+        if (g_gammaDim && m.dev != L"WMI") {
+            // gamma 状态不跨进程存活：无论 DDC 回读值是否一致，启动都必须重放
+            m.pct = last;
+            g_writer.Post({ m.dev }, last);
+            continue;
+        }
+        if (last == m.pct) continue;
         m.pct = last;
         g_writer.Post({ m.dev }, last);
     }
@@ -953,8 +1097,9 @@ static void CopyDiagnostics() {
     if (g_mons.empty()) g_mons = Scan();
     std::wstring t = std::wstring(L"lumen ") + APP_VERSION;
     wchar_t b[320];
-    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d",
-             g_lang, g_cfgTheme, g_step, g_cfgDelay, g_cfgAuto, g_cfgStartH, g_cfgEndH, g_cfgStart);
+    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d gamma=%d",
+             g_lang, g_cfgTheme, g_step, g_cfgDelay, g_cfgAuto, g_cfgStartH, g_cfgEndH,
+             g_cfgStart, g_gammaDim);
     t += b;
     swprintf(b, 320, L"\r\nhotkeys: up=%ls down=%ls show=%ls",
              HotkeyText(g_hkUpMod, g_hkUpVk).c_str(),
@@ -1159,7 +1304,11 @@ static void DrawPanel(Graphics& g, int W, int H) {
         g.FillEllipse(&b, x - r, y - r, r * 2, r * 2);
     }
 
-    // 进度弧槽（内阴影感） + 亮度进度弧（深色主题带辉光）
+    // 进度弧槽（内阴影感） + 亮度进度弧（HDR 激活时切换专属高亮发光样式）
+    bool hdrNow = false;
+    if (g_sel >= 0 && g_sel < (int)g_mons.size()) hdrNow = g_mons[g_sel].hdr;
+    else for (auto& mm : g_mons) if (mm.hdr) hdrNow = true;
+
     float trk = TRACK_R, tw = 13.f;
     RectF arc(KNOB_CX - trk, KNOB_CY - trk, trk * 2, trk * 2);
     Pen shade(g_pal.trackShade, tw + 3.f);
@@ -1168,7 +1317,7 @@ static void DrawPanel(Graphics& g, int W, int H) {
     g.DrawArc(&groove, arc.X, arc.Y, arc.Width, arc.Height, 120, 300);
     if (g_val > 0) {
         double sweep = g_val / 100.0 * 300.0;
-        if (g_dark) {
+        if (hdrNow) {
             for (int gp = 3; gp >= 1; --gp) {
                 Pen glow(Color(gp * 30, g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB()),
                          tw + gp * 5.f);
@@ -1183,8 +1332,9 @@ static void DrawPanel(Graphics& g, int W, int H) {
         double e = (120.0 + sweep) * PI / 180.0;
         float ex = KNOB_CX + trk * (float)cos(e);
         float ey = KNOB_CY + trk * (float)sin(e);
-        if (g_dark) {
-            SolidBrush halo(Color(90, g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB()));
+        if (g_dark || hdrNow) {
+            SolidBrush halo(Color(hdrNow ? 90 : 64,
+                                  g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB()));
             g.FillEllipse(&halo, ex - 15, ey - 15, 30.f, 30.f);
         }
         SolidBrush dot(g_pal.progDot);
@@ -1297,6 +1447,29 @@ static void DrawPanel(Graphics& g, int W, int H) {
     ap.SetEndCap(LineCapRound);
     g.DrawLine(&ap, ax - 4, ay - 2, ax, ay + 2.5f);
     g.DrawLine(&ap, ax, ay + 2.5f, ax + 4, ay - 2);
+
+    // HDR 徽章：胶囊右侧椭圆小牌，当前选中屏处于 Windows HDR 时出现（钛银蓝 / 琥珀辉光）
+    if (hdrNow) {
+        RectF chip(pill.GetRight() + 12, PILL_Y + (PILL_H - 26) / 2, 52, 26);
+        GraphicsPath csh;
+        RoundRect(csh, RectF(chip.X + 1.5f, chip.Y + 2.5f, chip.Width, chip.Height), 13.f);
+        SolidBrush cshb(g_pal.raisedSh);
+        g.FillPath(&cshb, &csh);
+        GraphicsPath cp;
+        RoundRect(cp, chip, 13.f);
+        LinearGradientBrush clg(PointF(chip.X, chip.Y), PointF(chip.X, chip.Y + chip.Height),
+                                g_pal.btn1, g_pal.btn2);
+        g.FillPath(&clg, &cp);
+        Pen chi(g_pal.raisedHi, 1.3f);
+        g.DrawPath(&chi, &cp);
+        Pen glow(hdrNow ? Color(g_dark ? 90 : 55,
+                                g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB())
+                        : Color(0, 0, 0, 0), 2.5f);
+        g.DrawPath(&glow, &cp);
+        Font fh2(L"Consolas", 12, FontStyleBold, UnitPixel);
+        SolidBrush ctb(g_pal.prog);
+        g.DrawString(L"HDR", -1, &fh2, chip, &sf, &ctb);
+    }
 
     // 提示
     SolidBrush hb(g_pal.hint);
@@ -1841,6 +2014,7 @@ static void DrawMonitorMenu(Graphics& g, int W, int H) {
             if (m.wmi)            label += tr(S_BUILTIN);
             else if (m.primary)   label += tr(S_PRIMARY);
             else                  label += tr(S_EXTERNAL);
+            if (m.hdr)            label += tr(S_HDR);
             if (!m.controllable)  label += tr(S_NOADJ);
         }
 
@@ -2235,6 +2409,7 @@ static void ShowMenu() {
     AppendMenuW(lm, MF_STRING | (cur == 2 ? MF_CHECKED : 0), 12, L"English");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)lm, tr(S_LANG));
     AppendMenuW(m, MF_STRING, 6, tr(S_DIAG));
+    AppendMenuW(m, MF_STRING | (g_gammaDim ? MF_CHECKED : 0), 7, tr(S_GAMMA));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 5, tr(S_SETTINGS));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -2247,6 +2422,12 @@ static void ShowMenu() {
     else if (cmd == 2) { Adjust(10); ShowOsd(); }
     else if (cmd == 3) { Adjust(-10); ShowOsd(); }
     else if (cmd == 6) CopyDiagnostics();
+    else if (cmd == 7) {
+        g_gammaDim = g_gammaDim ? 0 : 1;
+        RegPut(L"GammaDim", g_gammaDim);
+        if (!g_gammaDim) ResetGammaAll();        // 关闭即恢复恒等 gamma
+        else Post(g_val);                        // 开启立即按当前亮度应用
+    }
     else if (cmd == 10 || cmd == 11 || cmd == 12) {
         RegPut(L"Lang", cmd - 10);
         ApplyLang();
@@ -2424,6 +2605,8 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TIMER:
         if (wp == 2) ApplyAutoBrightness();
+        if (wp == 4 && RefreshHdrFlags(g_mons) && g_hwnd)
+            InvalidateRect(g_hwnd, nullptr, FALSE);   // HDR 开/关 → 徽章自动出现/消失
         return 0;
 
     case WM_SETTINGCHANGE:
@@ -2542,10 +2725,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     RegisterHotkeys();
     NotifyHotkeyFailures();
     SetTimer(g_msg, 2, 60000, nullptr);
+    SetTimer(g_msg, 4, 3000, nullptr);   // HDR 状态轮询
     g_winHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
                                 nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     g_writer.Start();
+    if (!g_gammaDim) ResetGammaAll();   // 归一遗留状态：上个实例被强杀时可能留下调暗的 ramp
     g_mons = Scan();
     ApplyNames(g_mons);
     RestoreBrightness();          // 重启后恢复每台屏的上次亮度
@@ -2572,6 +2757,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     }
 
     g_writer.Stop();
+    ResetGammaAll();
     UnregisterHotKey(g_msg, HK_UP);
     UnregisterHotKey(g_msg, HK_DOWN);
     UnregisterHotKey(g_msg, HK_TOGGLE);
