@@ -48,7 +48,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_DIM     (WM_APP + 8)   // wParam = dev string (heap), lParam = 遮罩黑度 0-85
 #define WM_WLCAL   (WM_APP + 9)   // wParam = 标定得到的滑条最大白电平（0 = 失败）
 
-#define APP_VERSION L"1.2.2"
+#define APP_VERSION L"1.3.0"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
@@ -110,6 +110,7 @@ static std::atomic<bool> g_fail{false};
 
 static int  g_cfgAuto = 0, g_cfgDelay = 25, g_cfgTheme = 0, g_cfgStart = 0;
 static int  g_cfgStartH = 7, g_cfgEndH = 19;
+static int  g_dayPct = 80, g_nightPct = 20;   // 到点后的目标亮度：日间 / 夜间
 static int  g_page = 0;   // 0 主面板 1 设置页
 static bool g_wantSettings = false;   // 首次建窗时直接进设置页
 
@@ -122,8 +123,10 @@ static UINT g_hkShowMod = MOD_CONTROL | MOD_ALT, g_hkShowVk = 'B';
 static int  g_capSlot = 0, g_hkMsg = 0;  // g_hkMsg: 0 无 / 1 被占用 / 2 需含 Ctrl 或 Alt
 static int  g_hover = -1;          // 0 胶囊，1..4 快捷按钮
 static bool g_screenOff = false;                // 熄屏状态：true = 已对选中屏幕发送关闭指令
-static DWORD g_offAt = 0;                       // 熄屏时刻，800ms 宽限期内忽略输入，防止点击按钮本身的输入触发恢复
+static DWORD g_offAt = 0;                       // 熄屏时刻，3 秒宽限期内忽略输入，防止误触把屏幕点回来
 static DWORD g_offInputBase = 0;                // 熄屏那一刻的「最后输入时间」，之后只有变化才算新输入
+static bool g_moved = false;                    // 用户拖动过面板：切页时保持位置，不再回到右下角
+static POINT g_movedPos{};                      // 拖动后的窗口左上角（屏幕坐标）
 static std::vector<std::wstring> g_offDevs;     // 已熄屏的外接 DDC 设备（\\.\DISPLAYn）
 static std::vector<int> g_offSaved;             // 与 g_offDevs 对应的熄屏前亮度快照（百分比）
 static bool g_offAll = false;                   // 是否同时广播 SC_MONITORPOWER（内置屏 / 「全部显示器」兜底）
@@ -151,7 +154,7 @@ static int g_gammaDim = 0;   // 软件调光：HDR 固件锁 DDC 亮度时的 ga
 static std::atomic<float> g_baseL{1.f};   // Windows 基准亮度系数（1 = 滑条最右 / 未标定）
 static DWORD g_dispChangeTick = 0;        // 最近一次显示模式切换（HDR 开关等）
 static std::atomic<bool> g_clamped{false};  // pct 超过 Windows 基准被钳制（提示用户拉高滑条）
-static std::atomic<int> g_wheelAccum{0};    // 托盘滚轮手势累积 delta（160ms 合并窗口）
+static std::atomic<bool> g_gammaDead{false}; // HDR 下 gamma LUT 不生效（读回校验失败）→ 全区间遮罩
 static POINT g_iconPt{};                    // 托盘图标实时位置（悬停时由 WM_MOUSEMOVE 更新）
 static bool g_iconHover = false;            // 是否已获得图标位置（获得后滚轮判定收窄到图标邻域）
 static bool g_calibrating = false;          // 校准中：下一次托盘左键点击记录图标位置
@@ -163,7 +166,7 @@ enum {
     S_HINT, S_FAIL, S_BACK, S_SETTINGS, S_AUTOSTART, S_AUTOBR, S_STARTH, S_ENDH, S_DDC, S_STEP,
     S_HOTKEYS, S_UP, S_DOWN, S_SHOWPILL, S_PRESSKEY, S_OCCUPIED, S_NEEDMOD, S_MODIFY, S_CANCEL, S_SIG,
     S_SHOWPANEL, S_BRIGHTUP, S_BRIGHTDN, S_DIAG, S_EXIT, S_LANG, S_GAMMA,
-    S_OCCUPFMT, S_UPDATEFMT, S_HDR,
+    S_OCCUPFMT, S_UPDATEFMT, S_HDR, S_DAYBR, S_NIGHTBR,
     S_MOUSESET, S_WHEELTRAY, S_WHEELPANEL,
     S_RESTOFF, S_RESTON,
     S_CAL, S_CALDONE, S_CALFAIL, S_CALIB, S_CALIBHINT, S_CALDONE2,
@@ -182,6 +185,7 @@ static const wchar_t* const STR_CN[S_COUNT] = {
     L"软件调光（HDR 显示器用）",
     L"%ls %ls：组合被占用", L"lumen 有新版本 %ls\nhttps://github.com/iosvcnm/lumen/releases/latest",
     L" · HDR",
+    L"日间亮度", L"夜间亮度",
     L"鼠标设置", L"托盘图标上滚轮调节亮度", L"面板打开时滚轮调节亮度",
     L"屏幕已关闭", L"屏幕已恢复",
     L"标定 HDR 基准亮度", L"标定完成：基准 %lu", L"标定失败：请先拖动「SDR 内容亮度」滑条",
@@ -200,6 +204,7 @@ static const wchar_t* const STR_EN[S_COUNT] = {
     L"Software dimming (for HDR monitors)",
     L"%ls %ls: combo occupied", L"lumen %ls is available\nhttps://github.com/iosvcnm/lumen/releases/latest",
     L" · HDR",
+    L"Day brightness", L"Night brightness",
     L"Mouse", L"Wheel on tray icon adjusts brightness", L"Wheel in panel adjusts brightness",
     L"Screen is off", L"Screen restored",
     L"Calibrate HDR base brightness", L"Calibration done: base %lu", L"Calibration failed: drag the SDR content brightness slider",
@@ -269,6 +274,8 @@ static void LoadConfig() {
     g_cfgStart = RegGet(L"Autostart", 0);
     g_cfgStartH = std::max(0, std::min(23, RegGet(L"AutoStartH", 7)));
     g_cfgEndH   = std::max(0, std::min(23, RegGet(L"AutoEndH", 19)));
+    g_dayPct    = std::max(0, std::min(100, RegGet(L"DayPct", 80)));
+    g_nightPct  = std::max(0, std::min(100, RegGet(L"NightPct", 20)));
     if (g_cfgEndH <= g_cfgStartH) g_cfgEndH = std::min(23, g_cfgStartH + 1);
     g_hkUpMod  = (UINT)RegGet(L"HotUpMod", MOD_CONTROL);
     g_hkUpVk   = (UINT)RegGet(L"HotUpVk", VK_PRIOR);
@@ -842,81 +849,143 @@ static HDC DcForDev(const std::wstring& dev) {
     return nullptr;
 }
 
-static void WriteRamp(HDC dc, float scale) {
-    WORD r[3][256];
-    for (int i = 0; i < 256; ++i) {
-        WORD v = (WORD)std::min(65535L, (long)i * 257);
-        if (scale < 1.f) v = (WORD)(v * scale);
-        r[0][i] = r[1][i] = r[2][i] = v;
-    }
-    SetDeviceGammaRamp(dc, r);
+// ---- Gamma 备份：进入软件调光前的原始 LUT（含校色曲线），退出时原样写回 ----
+struct RampBak { std::wstring dev; WORD r[3][256]; };
+static std::vector<RampBak> g_rampBak;
+
+static RampBak* FindRampBak(const std::wstring& dev) {
+    for (auto& b : g_rampBak) if (b.dev == dev) return &b;
+    return nullptr;
 }
 
-// ---- 白电平补偿：lumen 百分比 = 总亮度（Windows 基准 × gamma 调光的乘积）----
-// Windows「SDR 内容亮度」滑条设定基准白电平（SDRWL，1000=80nit 基准），
-// 读取随 3 秒轮询更新；lumen 据此换算 gamma，使 pct 语义不受滑条位置影响。
-// 标定：托盘「标定 HDR 基准亮度」记录滑条最右端对应的 SDRWL（WlMax），WlMin 固定 1000。
+static void BackupRamp(const std::wstring& dev, HDC dc) {
+    if (FindRampBak(dev)) return;
+    RampBak b;
+    b.dev = dev;
+    if (!GetDeviceGammaRamp(dc, b.r)) return;
+    // 上次被强杀可能留下调暗的 LUT（中点明显低于恒等）：先归一，再作为备份
+    if (b.r[0][128] < 27900) {
+        WORD id[3][256];
+        for (int i = 0; i < 256; ++i)
+            id[0][i] = id[1][i] = id[2][i] = (WORD)std::min(65535L, (long)i * 257);
+        SetDeviceGammaRamp(dc, id);
+        for (int c = 0; c < 3; ++c)
+            for (int i = 0; i < 256; ++i) b.r[c][i] = id[c][i];
+    }
+    g_rampBak.push_back(b);
+}
 
+// 在原始 LUT 上乘系数，保留校色曲线；没有备份时才退回恒等 ramp
+// 每屏 DC 只建一次并复用：HDR 模式下 CreateDCW/DeleteDC 可能永久阻塞，
+// 反复创建会把写入线程卡死，后续调节全部被跳过。
+static std::map<std::wstring, HDC> g_dcCache;
+
+static HDC DcCached(const std::wstring& dev) {
+    auto it = g_dcCache.find(dev);
+    if (it != g_dcCache.end()) return it->second;
+    HDC dc = DcForDev(dev);
+    if (dc) g_dcCache[dev] = dc;
+    return dc;
+}
+
+static void DropDcCache() {          // 显示拓扑变化后重建（旧 DC 不再 Delete，避免卡死）
+    g_dcCache.clear();
+}
+
+static bool WriteRamp(HDC dc, const std::wstring& dev, float scale) {
+    WORD out[3][256];
+    const RampBak* b = FindRampBak(dev);
+    for (int c = 0; c < 3; ++c)
+        for (int i = 0; i < 256; ++i) {
+            long v = b ? (long)b->r[c][i] : std::min(65535L, (long)i * 257);
+            out[c][i] = (WORD)std::min(65535L, (long)(v * scale));
+        }
+    BOOL w = SetDeviceGammaRamp(dc, out);
+    WORD chk[3][256];
+    if (!w || !GetDeviceGammaRamp(dc, chk)) return false;
+    return std::abs((int)chk[0][128] - (int)out[0][128]) <= 64;   // 读回校验：HDR 下部分驱动直接忽略 LUT
+}
+
+// 退出 / 关闭软件调光：把备份的原始 LUT 写回（没有备份的屏退回恒等）
+static void RestoreRampsAll() {
+    std::vector<HMONITOR> hs;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM lp) {
+        ((std::vector<HMONITOR>*)lp)->push_back(h); return TRUE;
+    }, (LPARAM)&hs);
+    for (HMONITOR h : hs) {
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(h, (MONITORINFO*)&mi)) continue;
+        HDC dc = CreateDCW(mi.szDevice, mi.szDevice, nullptr, nullptr);
+        if (!dc) continue;
+        RampBak* b = FindRampBak(mi.szDevice);
+        if (b) {
+            SetDeviceGammaRamp(dc, b->r);
+        } else {
+            WORD id[3][256];
+            for (int i = 0; i < 256; ++i)
+                id[0][i] = id[1][i] = id[2][i] = (WORD)std::min(65535L, (long)i * 257);
+            SetDeviceGammaRamp(dc, id);
+        }
+        DeleteDC(dc);
+    }
+}
+
+// HDR 软件调光的两段式（10% 临界点，两段在 10% 处亮度连续）：
+//   pct >= 10%：纯 gamma LUT，遮罩 alpha = 0
+//   pct <  10%：gamma 锁死在 10% 的基准值，遮罩 alpha 从 0 线性加深到 0.94（透光 6%）
+// gamma 在 HDR 下不生效时（部分驱动只对 SDR 叠加层应用 LUT），退化为全区间遮罩。
 static void ComputeDim(int pct, float* scaleOut, int* dimOut) {
     float target = std::max(0, std::min(100, pct)) / 100.f;
     float baseL = g_baseL.load();
     if (baseL < 0.05f) baseL = 1.f;
+
+    if (g_gammaDead.load()) {             // 全区间遮罩：gamma 不动，遮罩直接按总亮度压
+        *scaleOut = 1.f;
+        float t = target;
+        if (t < 0.06f) t = 0.06f;
+        *dimOut = (int)lround((1.f - t) * 100.f);
+        g_clamped.store(false);
+        return;
+    }
+
+    const float kKnee = 0.10f;            // 10% 临界点
     float gammaL = target / baseL;        // ramp 需要提供的亮度系数
     float scale = powf(gammaL, 1.f / 2.2f);
-    int dim = 0;
     g_clamped.store(gammaL > 1.f);        // 超过 Windows 基准 → 钳制
     if (scale > 1.f) scale = 1.f;         // Windows 基准即上限：更亮请调 Windows 滑条
-    if (scale < 0.5f) {                   // 击穿下限 → 遮罩接管
-        scale = 0.5f;
-        float t = (gammaL > 0.001f) ? gammaL / 0.2176f : 0.f;   // 遮罩透射率
-        if (t > 1.f) t = 1.f;
-        if (t < 0.06f) t = 0.06f;         // 最深 ≈ 总亮度 3%
-        dim = (int)((1.f - t) * 85.f);
+
+    int dim = 0;
+    if (target < kKnee) {
+        float kneeL = kKnee / baseL;      // 10% 处需要的亮度系数
+        scale = std::min(1.f, powf(kneeL, 1.f / 2.2f));
+        float t = target / kKnee;         // 遮罩透射率：10% → 1，0% → 0
+        if (t < 0.06f) t = 0.06f;         // 最深 ≈ 总亮度 6%
+        dim = (int)lround((1.f - t) * 100.f);
     }
     *scaleOut = scale;
     *dimOut = dim;
 }
 
-struct GammaJob { std::wstring dev; float scale; };
-
-// GDI 显示调用在 HDR 模式切换瞬间可能永久阻塞——gamma 应用放到独立线程，
-// 写入线程 1 秒超时即放弃（泄漏该线程），后续写入自愈重试
-static std::atomic<void*> g_gammaPending{nullptr};
-
-static DWORD WINAPI GammaApplierThread(LPVOID lp) {
-    auto* job = (GammaJob*)lp;
-    HDC dc = DcForDev(job->dev);
-    if (dc) { WriteRamp(dc, job->scale); DeleteDC(dc); }
-    delete job;
-    return 0;
-}
-
 static bool ApplyGammaScale(const std::wstring& dev, float scale) {
-    static HANDLE s_pending = nullptr;      // 上一个未完成的 applier
-    static int s_skips = 0;
-    if (s_pending) {
-        if (WaitForSingleObject(s_pending, 0) == WAIT_OBJECT_0) {
-            CloseHandle(s_pending);
-            s_pending = nullptr;
-        } else if (++s_skips > 5) {
-            // 永久卡死（模式切换死锁不解除）：放弃旧线程，允许新尝试自愈
-            CloseHandle(s_pending);
-            s_pending = nullptr;
-            s_skips = 0;
-        } else {
-            return false;                   // 上一个还卡着：本次跳过，下次写入重试
+    // 在 Writer 线程里同步写：HDR 下 GDI 调用可能很慢甚至卡住，
+    // 放到子线程会造成写入错序（后一次调节被前一次覆盖），不如直接写、顺序确定。
+    HDC dc = DcCached(dev);
+    if (!dc) return false;
+    BackupRamp(dev, dc);
+    bool ok = WriteRamp(dc, dev, scale);
+    if (!ok) {
+        static int s_bad = 0;
+        if (++s_bad >= 2) {
+            g_gammaDead.store(true);      // 连续两次读回不符：此环境 LUT 不生效，转全区间遮罩
+            const RampBak* b = FindRampBak(dev);
+            if (b) SetDeviceGammaRamp(dc, (LPVOID)b->r);
         }
+    } else {
+        static int s_ok = 0;
+        (void)s_ok;
     }
-    auto* job = new GammaJob{dev, scale};
-    HANDLE h = CreateThread(nullptr, 0, GammaApplierThread, job, 0, nullptr);
-    if (!h) { delete job; return false; }
-    Sleep(50);
-    if (WaitForSingleObject(h, 950) == WAIT_TIMEOUT) {
-        s_pending = h;                      // 卡住的 applier：泄漏并跳过后续
-        return false;
-    }
-    CloseHandle(h);
-    return true;
+    return ok;
 }
 
 static void ResetGammaAll() {
@@ -930,7 +999,7 @@ static void ResetGammaAll() {
         if (!GetMonitorInfoW(h, (MONITORINFO*)&mi)) continue;
         HDC dc = CreateDCW(mi.szDevice, mi.szDevice, nullptr, nullptr);
         if (!dc) continue;
-        WriteRamp(dc, 1.f);      // 恒等 ramp = Windows 默认状态
+        WriteRamp(dc, mi.szDevice, 1.f);   // 1.0 = 写回备份的原始 LUT
         DeleteDC(dc);
     }
 }
@@ -1009,7 +1078,7 @@ static void OverlayApply(const std::wstring& dev, int blackPct) {
         SetWindowPos(w, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
                      SWP_NOACTIVATE | SWP_NOZORDER);
     }
-    SetLayeredWindowAttributes(w, 0, (BYTE)(255 * std::min(85, blackPct) / 100), LWA_ALPHA);
+    SetLayeredWindowAttributes(w, 0, (BYTE)(255 * std::min(94, blackPct) / 100), LWA_ALPHA);
     if (g_hwnd) SetWindowPos(w, g_hwnd, 0, 0, 0, 0,   // 遮罩垫到面板之下
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
@@ -1032,11 +1101,14 @@ static bool WriteOne(const std::wstring& dev, int pct, unsigned delayMs) {
         float scale = 1.f;
         int dim = 0;
         ComputeDim(pct, &scale, &dim);          // 白电平补偿：pct = 总亮度（Windows 基准无关）
-        bool ok = true;
-        if (g_dispChangeTick && GetTickCount() - g_dispChangeTick < 2500)
-            g_dispChangeTick = 1;               // 切换静默期：延后，下次调节自动应用
-        else
-            ok = ApplyGammaScale(dev, scale);
+            bool ok = true;
+            if (g_gammaDead.load()) {
+                // gamma LUT 在此环境不生效：不再写 ramp，全部交给遮罩
+            } else if (g_dispChangeTick && GetTickCount() - g_dispChangeTick < 2500) {
+                g_dispChangeTick = 1;               // 切换静默期：延后，下次调节自动应用
+            } else {
+                ok = ApplyGammaScale(dev, scale);
+            }
         if (g_msg) PostMessageW(g_msg, WM_DIM, (WPARAM)_wcsdup(dev.c_str()), (LPARAM)dim);
         if (delayMs) Sleep(delayMs);
         return ok;
@@ -1434,6 +1506,7 @@ static void RestoreFromScreenOff() {
 }
 
 static void Post(int pct) {
+    if (g_screenOff) return;   // 熄屏期间禁止写亮度：避免污染 Last_<key> 记忆（恢复走 g_writer.Post 绕过此入口）
     pct = std::max(0, std::min(100, pct));
     g_val = pct;
     std::vector<std::wstring> devs;
@@ -1989,12 +2062,22 @@ static void PlacePanel() {
     if (!g_hwnd) return;
     RECT wa = SafeWorkArea(g_hwnd);
     int w = (int)(Scale(PANEL_W) * UI_SCALE), h = (int)(Scale(PageH()) * UI_SCALE), m = Scale(11);
-    int x = wa.right - w - m;
-    int y = wa.bottom - h - m;
+    int x, y;
+    if (g_moved) {
+        // 用户拖过面板：切页时保持左上角，只在越出工作区时收回
+        x = g_movedPos.x;
+        y = g_movedPos.y;
+        if (x + w > wa.right - m) x = wa.right - w - m;
+        if (y + h > wa.bottom - m) y = wa.bottom - h - m;
+    } else {
+        x = wa.right - w - m;
+        y = wa.bottom - h - m;
+    }
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
     BindRound(g_hwnd, w, h, 34, UI_SCALE);
+    if (g_moved) { g_movedPos.x = x; g_movedPos.y = y; }   // 收回后同步，连续切页不漂移
 }
 
 static void OnPanelPaint(HWND hwnd) {
@@ -2141,9 +2224,13 @@ static const float SET_HK = 394.f, SET_HK_STEP = 44.f;
 
 static float  SetRowY(int i)          { return 112.f + i * 52.f; }
 static RectF  SetToggleRect(int i)    { return RectF(SET_R - 44.f, SetRowY(i) - 4.f, 44.f, 24.f); }
-static RectF  SetMinusRect(int i)     { return RectF(236.f, SetRowY(i) - 6.f, 30.f, 30.f); }
-static RectF  SetPlusRect(int i)      { return RectF(334.f, SetRowY(i) - 6.f, 30.f, 30.f); }
-static RectF  SetValueRect(int i)     { return RectF(270.f, SetRowY(i) - 6.f, 60.f, 28.f); }
+// 第 2/3 行双列：左列 时间，右列 亮度，各自带加减
+static RectF  SetTimeValueRect(int i) { return RectF(96.f,  SetRowY(i) - 6.f, 40.f, 28.f); }
+static RectF  SetTimeMinusRect(int i) { return RectF(140.f, SetRowY(i) - 6.f, 30.f, 30.f); }
+static RectF  SetTimePlusRect(int i)  { return RectF(172.f, SetRowY(i) - 6.f, 30.f, 30.f); }
+static RectF  SetPctValueRect(int i)  { return RectF(258.f, SetRowY(i) - 6.f, 42.f, 28.f); }
+static RectF  SetPctMinusRect(int i)  { return RectF(302.f, SetRowY(i) - 6.f, 30.f, 30.f); }
+static RectF  SetPctPlusRect(int i)   { return RectF(334.f, SetRowY(i) - 6.f, 30.f, 30.f); }
 // 第 4 行左右各半：左 DDC 间隔，右 步长
 static RectF  SetDdcValue()           { return RectF(110.f, SetRowY(4) - 6.f, 54.f, 28.f); }
 static RectF  SetDdcMinus()           { return RectF(168.f, SetRowY(4) - 6.f, 30.f, 30.f); }
@@ -2197,23 +2284,28 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
     g.DrawLine(&sep, SET_L, 96.f, SET_R, 96.f);
 
     wchar_t buf[32];
-    const wchar_t* label[4] = { tr(S_AUTOSTART), tr(S_AUTOBR), tr(S_STARTH), tr(S_ENDH) };
-    for (int i = 0; i < 4; ++i) {
-        bool muted = (i == 2 || i == 3);
-        g.DrawString(label[i], -1, &fl, PointF(SET_L, SetRowY(i)), muted ? &sb : &tb);
-    }
+    g.DrawString(tr(S_AUTOSTART), -1, &fl, PointF(SET_L, SetRowY(0)), &tb);
+    g.DrawString(tr(S_AUTOBR), -1, &fl, PointF(SET_L, SetRowY(1)), &tb);
 
     ToggleTrack(g, SetToggleRect(0).X, SetToggleRect(0).Y, g_cfgStart != 0, g_dark);
     ToggleTrack(g, SetToggleRect(1).X, SetToggleRect(1).Y, g_cfgAuto != 0, g_dark);
 
     Font fv13(L"Microsoft YaHei UI", 13, FontStyleBold, UnitPixel);
+    Font fv12(L"Microsoft YaHei UI", 12, FontStyleBold, UnitPixel);   // 双列数值：12px 才放得下 "08:00" 不折行
     for (int i = 2; i <= 3; ++i) {
+        // 左列：时间；右列：到点后的目标亮度，两列同排
+        g.DrawString(i == 2 ? tr(S_STARTH) : tr(S_ENDH), -1, &fl, PointF(SET_L, SetRowY(i)), &sb);
+        g.DrawString(i == 2 ? tr(S_DAYBR) : tr(S_NIGHTBR), -1, &fs, PointF(206.f, SetRowY(i) + 2), &sb);
+
         swprintf(buf, 32, L"%02d:00", i == 2 ? g_cfgStartH : g_cfgEndH);
-        RectF vr = SetValueRect(i);
-        g.DrawString(buf, -1, &fv, vr, &rgt, &tb);
-        RectF mr = SetMinusRect(i), pr = SetPlusRect(i);
-        MiniButton(g, mr.X, mr.Y, false);
-        MiniButton(g, pr.X, pr.Y, true);
+        g.DrawString(buf, -1, &fv12, SetTimeValueRect(i), &rgt, &tb);
+        MiniButton(g, SetTimeMinusRect(i).X, SetTimeMinusRect(i).Y, false);
+        MiniButton(g, SetTimePlusRect(i).X, SetTimePlusRect(i).Y, true);
+
+        swprintf(buf, 32, L"%d%%", i == 2 ? g_dayPct : g_nightPct);
+        g.DrawString(buf, -1, &fv12, SetPctValueRect(i), &rgt, &tb);
+        MiniButton(g, SetPctMinusRect(i).X, SetPctMinusRect(i).Y, false);
+        MiniButton(g, SetPctPlusRect(i).X, SetPctPlusRect(i).Y, true);
     }
     // 第 4 行：左 DDC 间隔 / 右 步长
     g.DrawString(tr(S_DDC), -1, &fl, PointF(SET_L, SetRowY(4)), &tb);
@@ -2299,6 +2391,7 @@ static void HidePanel() {
     }
     DestroyWindow(g_hwnd);
     g_hwnd = nullptr;
+    g_moved = false;                     // 下次打开回到右下角默认位置
 }
 
 // 按下时的命中判定：环带 ±20 px，底部 60° 为死区
@@ -2467,6 +2560,8 @@ static int HitButton(int x, int y) {
     return -1;
 }
 
+static void ApplyAutoBrightness();   // 定义在后面；开关打开时要立即应用，不等下一次定时器
+
 static void OnQuickAction(int idx) {
     if (idx == 1) {
         // 跟随系统时切到当前观感的反色；强制浅/深时一键回「跟随系统」
@@ -2479,7 +2574,7 @@ static void OnQuickAction(int idx) {
     } else if (idx == 2) {
         g_cfgAuto = g_cfgAuto ? 0 : 1;
         RegPut(L"AutoBrightness", g_cfgAuto);
-        if (g_cfgAuto) Adjust(0);
+        if (g_cfgAuto) ApplyAutoBrightness();
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
     } else if (idx == 3) {
         g_dragging = false;
@@ -2587,18 +2682,27 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             for (int i = 2; i <= 3; ++i) {
-                bool minus = InRect(SetMinusRect(i), x, y);
-                bool plus  = InRect(SetPlusRect(i), x, y);
-                if (!minus && !plus) continue;
-                if (i == 2) {
-                    g_cfgStartH = (g_cfgStartH + (plus ? 1 : 23)) % 24;
-                    if (g_cfgEndH <= g_cfgStartH) g_cfgEndH = std::min(23, g_cfgStartH + 1);
-                    RegPut(L"AutoStartH", g_cfgStartH);
-                    RegPut(L"AutoEndH", g_cfgEndH);
+                bool tminus = InRect(SetTimeMinusRect(i), x, y);
+                bool tplus  = InRect(SetTimePlusRect(i), x, y);
+                bool pminus = InRect(SetPctMinusRect(i), x, y);
+                bool pplus  = InRect(SetPctPlusRect(i), x, y);
+                if (!tminus && !tplus && !pminus && !pplus) continue;
+                if (tminus || tplus) {
+                    if (i == 2) {
+                        g_cfgStartH = (g_cfgStartH + (tplus ? 1 : 23)) % 24;
+                        if (g_cfgEndH <= g_cfgStartH) g_cfgEndH = std::min(23, g_cfgStartH + 1);
+                        RegPut(L"AutoStartH", g_cfgStartH);
+                        RegPut(L"AutoEndH", g_cfgEndH);
+                    } else {
+                        g_cfgEndH = tplus ? std::min(23, g_cfgEndH + 1)
+                                          : std::max(g_cfgStartH + 1, g_cfgEndH - 1);
+                        RegPut(L"AutoEndH", g_cfgEndH);
+                    }
                 } else {
-                    g_cfgEndH = plus ? std::min(23, g_cfgEndH + 1)
-                                     : std::max(g_cfgStartH + 1, g_cfgEndH - 1);
-                    RegPut(L"AutoEndH", g_cfgEndH);
+                    int v = (i == 2) ? g_dayPct : g_nightPct;
+                    v = pplus ? std::min(100, v + 5) : std::max(0, v - 5);
+                    if (i == 2) { g_dayPct = v; RegPut(L"DayPct", v); }
+                    else        { g_nightPct = v; RegPut(L"NightPct", v); }
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -2652,10 +2756,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_dragging) { g_dragging = false; ReleaseCapture(); }
         return 0;
 
-    case WM_MOUSEWHEEL:
+    case WM_MOUSEWHEEL: {
         if (g_page == 1 || g_capSlot || g_menuOpen || !g_wheelPanel) return 0;
-        Post(g_val + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? g_step : -g_step));
+        int d = GET_WHEEL_DELTA_WPARAM(wp);
+        int steps = (d / WHEEL_DELTA) * g_step;
+        if (!steps) steps = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）
+        Post(g_val + steps);
         return 0;
+    }
 
     case WM_KEYDOWN:
         if (g_capSlot) {
@@ -2704,6 +2812,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
+
+    case WM_EXITSIZEMOVE: {
+        RECT r{};
+        if (GetWindowRect(hwnd, &r)) {   // 用户拖动结束：记住位置，切页沿用
+            g_moved = true;
+            g_movedPos = POINT{ r.left, r.top };
+        }
+        return 0;
+    }
 
     case WM_NCHITTEST: {
         POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -3120,16 +3237,21 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD ev, HWND hwnd, LONG, LONG
 }
 
 static void ApplyAutoBrightness() {
-    if (!g_cfgAuto) return;
+    if (!g_cfgAuto || g_screenOff) return;   // 熄屏期间不写亮度，避免覆盖恢复快照与 Last_ 记忆
     SYSTEMTIME st{};
     GetLocalTime(&st);
     double h = st.wHour + st.wMinute / 60.0;
     double s0 = g_cfgStartH, s1 = g_cfgEndH;
     if (s1 <= s0) s1 = s0 + 1;
-    double t = 1.0;
-    if (h >= s1) t = 0.0;
-    else if (h > s0) t = 1.0 - (h - s0) / (s1 - s0);
-    Post((int)lround(25 + t * 75));
+    const double ramp = 8.0 / 60.0;          // 到点后 8 分钟渐变（用户要求的 5~10 分钟区间）
+    double day = g_dayPct, night = g_nightPct;
+    double pct;
+    if (h < s0)             pct = night;                                      // 天亮前
+    else if (h < s0 + ramp) pct = night + (day - night) * (h - s0) / ramp;    // 到开始时间：升到日间亮度
+    else if (h < s1)        pct = day;                                        // 白天保持
+    else if (h < s1 + ramp) pct = day + (night - day) * (h - s1) / ramp;      // 到结束时间：降到夜间亮度
+    else                    pct = night;                                      // 夜间保持
+    Post((int)lround(pct));
 }
 
 static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3157,8 +3279,11 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (!hit && g_iconHover)          // 图标矩形取不到时，退回校准位置 ±20/±26
                         hit = abs(pt.x - g_iconPt.x) <= 20 && abs(pt.y - g_iconPt.y) <= 26;
                     if (hit) {
-                        g_wheelAccum.fetch_add(d);
-                        SetTimer(g_msg, 5, 160, nullptr);   // 手势合并：静默后按累积量一次应用
+                        // 按实际格数即时生效：快速滚动时数值跟手，写入频率由 Writer 合并
+                        int steps = (d / WHEEL_DELTA) * g_step;
+                        if (!steps) steps = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）
+                        Post(g_val + steps);
+                        ShowOsd();
                     }
                 }
             }
@@ -3212,26 +3337,16 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER:
-        if (wp == 5) {                           // 托盘滚轮手势合并应用
-            KillTimer(g_msg, 5);
-            int acc = g_wheelAccum.exchange(0);
-            if (acc) {
-                int steps = (int)llround((double)acc / 120.0 * g_step);
-                if (steps == 0) steps = acc > 0 ? 1 : -1;
-                steps = std::clamp(steps, -2, 2);   // ② 快速甩动的最大跳变钳制
-                g_val = std::max(0, std::min(100, g_val + steps));
-                Post(g_val);
-                ShowOsd();
-            }
-            return 0;
-        }
         if (wp == 6) {                           // 熄屏后等任意输入再点亮
             if (!g_screenOff) { KillTimer(g_msg, 6); return 0; }
             LASTINPUTINFO li{};
             li.cbSize = sizeof(li);
-            if (GetLastInputInfo(&li) &&
-                li.dwTime != g_offInputBase &&                  // 出现新输入（熄屏那一下不算）
-                GetTickCount() - g_offAt > 800) {               // 800ms 宽限，避开熄屏按钮本身
+            if (!GetLastInputInfo(&li)) return 0;
+            if (GetTickCount() - g_offAt < 3000) {
+                g_offInputBase = li.dwTime;      // 3 秒内的误触一律吞掉，不算唤醒输入
+                return 0;
+            }
+            if (li.dwTime != g_offInputBase) {
                 KillTimer(g_msg, 6);
                 RestoreFromScreenOff();
             }
@@ -3277,6 +3392,15 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE;
 
     case WM_CLOSE:
+        if (g_screenOff) {                       // 退出时若仍处于熄屏：先点亮再退，避免屏幕留在黑屏状态
+            g_screenOff = false;
+            KillTimer(g_msg, 6);
+            for (auto& dev : g_offDevs) SetMonitorPowerDDC(dev, 1);
+            if (g_offAll)
+                PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, (LPARAM)-1);
+            g_offDevs.clear();
+            g_offSaved.clear();
+        }
         if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
         RemoveTray();
         PostQuitMessage(0);
@@ -3367,6 +3491,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     g_writer.Start();
     if (!g_gammaDim) ResetGammaAll();   // 归一遗留状态：上个实例被强杀时可能留下调暗的 ramp
+    if (g_gammaDim) {
+        // 预热每屏 DC：HDR 下 CreateDCW 可能长时间阻塞，放在主线程启动阶段做一次
+        std::vector<HMONITOR> hs;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM lp) {
+            ((std::vector<HMONITOR>*)lp)->push_back(h); return TRUE;
+        }, (LPARAM)&hs);
+        for (HMONITOR h : hs) {
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(h, (MONITORINFO*)&mi)) DcCached(mi.szDevice);
+        }
+    }
     g_mons = Scan();
     ApplyNames(g_mons);
     RestoreBrightness();          // 重启后恢复每台屏的上次亮度
@@ -3393,7 +3529,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     }
 
     g_writer.Stop();
-    ResetGammaAll();
+    RestoreRampsAll();       // 退出：把备份的原始 gamma LUT 写回
     OverlayCloseAll();
     UnregisterHotKey(g_msg, HK_UP);
     UnregisterHotKey(g_msg, HK_DOWN);

@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lumen 1.2.1 → 1.3.0 改动说明</title>
+<style>
+  :root {
+    --bg: #fbfbf9;
+    --card: #ffffff;
+    --text: #1c1c1a;
+    --muted: #6b6b66;
+    --line: #e4e4df;
+    --accent: #3d6ea8;
+    --ok-bg: #e3f2e9;
+    --ok-fg: #1d6b45;
+    --wip-bg: #faf0d9;
+    --wip-fg: #7a5a12;
+    --code-bg: #f2f2ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161617;
+      --card: #1e1e20;
+      --text: #e8e8e4;
+      --muted: #9a9a94;
+      --line: #303032;
+      --accent: #7aa6d8;
+      --ok-bg: #16332a;
+      --ok-fg: #7fd3a5;
+      --wip-bg: #33291466;
+      --wip-fg: #e0bb6a;
+      --code-bg: #26262a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 20px 80px;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+    font-size: 15px; line-height: 1.75;
+  }
+  main { max-width: 880px; margin: 0 auto; }
+  header { margin-bottom: 36px; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 26px; font-weight: 600; margin: 0 0 8px; letter-spacing: -0.2px; }
+  .sub { color: var(--muted); font-size: 13.5px; margin: 0; }
+  h2 {
+    font-size: 19px; font-weight: 600; margin: 44px 0 14px;
+    padding-left: 11px; border-left: 3px solid var(--accent);
+  }
+  h3 { font-size: 15.5px; font-weight: 600; margin: 26px 0 8px; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  h3 .num { color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+  p { margin: 9px 0; }
+  ul { margin: 9px 0; padding-left: 22px; }
+  li { margin: 5px 0; }
+  code {
+    background: var(--code-bg); border-radius: 4px;
+    padding: 1.5px 5px; font-size: 13px;
+    font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  }
+  pre {
+    background: var(--code-bg); border-radius: 8px; padding: 14px 16px;
+    overflow-x: auto; font-size: 13px; line-height: 1.7; margin: 12px 0;
+    font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    width: 100%; border-collapse: collapse; margin: 14px 0 18px;
+    font-size: 13.5px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  }
+  th, td { text-align: left; padding: 9px 13px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; font-size: 13px; white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .badge {
+    font-size: 11.5px; font-weight: 500; padding: 2px 8px; border-radius: 999px;
+    white-space: nowrap; line-height: 1.5;
+  }
+  .badge.ok { background: var(--ok-bg); color: var(--ok-fg); }
+  .badge.wip { background: var(--wip-bg); color: var(--wip-fg); }
+  .lead {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 4px 20px 10px; margin: 22px 0 8px;
+  }
+  .note {
+    border-left: 3px solid var(--line); padding: 2px 0 2px 14px;
+    color: var(--muted); font-size: 13.5px; margin: 14px 0;
+  }
+  .toc { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 22px; margin: 26px 0; }
+  .toc ol { margin: 0; padding-left: 20px; }
+  .toc li { margin: 4px 0; font-size: 13.5px; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+  footer { margin-top: 56px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12.5px; }
+  @media (max-width: 620px) {
+    body { padding: 24px 14px 60px; font-size: 14px; }
+    h1 { font-size: 21px; }
+    table { font-size: 12.5px; }
+    th, td { padding: 7px 9px; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>lumen 1.2.1 → 1.3.0 改动说明</h1>
+  <p class="sub">基准提交 <code>6c8a178</code>（版本号 1.2.1） · 目标为当前工作区 · 生成于 2026-11-09</p>
+</header>
+
+<div class="lead">
+<table>
+  <tr><th style="width:38%">项目</th><th>1.2.1</th><th>当前</th></tr>
+  <tr><td>主源码行数</td><td class="num">2,770</td><td class="num">3,534（+764）</td></tr>
+  <tr><td>代码变更</td><td class="num">—</td><td class="num">+845 / −80</td></tr>
+  <tr><td>快捷按钮</td><td class="num">3 个</td><td class="num">4 个</td></tr>
+  <tr><td>设置页（逻辑像素）</td><td class="num">400 × 570</td><td class="num">400 × 700</td></tr>
+  <tr><td>配置项</td><td class="num">16 个</td><td class="num">23 个（+7）</td></tr>
+  <tr><td>回归工具</td><td class="num">18 个</td><td class="num">23 个（+5）</td></tr>
+</table>
+</div>
+
+<p>改动分两部分：熄屏与标定（提交 <code>a1b1b6e</code>）与其余增强（原工作区在研）。1.2.2 从未单独发行，两部分一并随 <strong>v1.3.0</strong> 发布。</p>
+
+<nav class="toc">
+  <ol>
+    <li><a href="#new">新增功能</a></li>
+    <li><a href="#improve">行为改进</a></li>
+    <li><a href="#fix">修复</a></li>
+    <li><a href="#tools">工程与工具</a></li>
+    <li><a href="#config">配置项变化</a></li>
+    <li><a href="#limits">已知边界</a></li>
+    <li><a href="#files">文件清单</a></li>
+  </ol>
+</nav>
+
+<h2 id="new">一、新增功能</h2>
+
+<h3><span class="num">1.1</span>熄屏按钮</h3>
+<p>快捷按钮从 3 个增加到 4 个，顺序为 <strong>主题 / 自动 / 设置 / 熄屏</strong>，新增电源图标按钮。</p>
+<table>
+  <tr><th style="width:22%">环节</th><th>实现</th></tr>
+  <tr><td>关闭</td><td>对选中屏写 DDC/CI <code>VCP 0xD6</code>：先 4（软关），200 ms 后读回确认；不生效再试 5（硬关）</td></tr>
+  <tr><td>兜底</td><td>两种值都失效时广播 <code>SC_MONITORPOWER</code>（系统级关屏，必然生效，代价是所有屏一起关）</td></tr>
+  <tr><td>记忆</td><td>熄屏前记录每台屏的当前亮度</td></tr>
+  <tr><td>恢复</td><td>任意键鼠输入后写 <code>0xD6=1</code>（部分固件需二次点亮），并回放熄屏前亮度</td></tr>
+</table>
+
+<h3><span class="num">1.2</span>熄屏防误触</h3>
+<p>原来熄屏后 800 ms 就会恢复——因为「按下熄屏按钮」本身就是一次输入，被判定为「用户动了」。</p>
+<p>现在改为：熄屏瞬间记录当前系统输入时间戳作为基线，<strong>3 秒宽限期内持续吸收</strong>所有输入（每 150 ms 刷新基线），3 秒后只有出现<strong>新的</strong>输入才点亮。</p>
+
+<h3><span class="num">1.3</span>设置页扩展与鼠标设置</h3>
+<ul>
+  <li>设置页从 400×570 加高到 400×700，切换页面时窗口底部锚点不变</li>
+  <li>新增「鼠标设置」分组：托盘图标滚轮开关、面板内滚轮开关</li>
+  <li>两个开关分别持久化到 <code>WheelTray</code> / <code>WheelPanel</code></li>
+</ul>
+
+<h3><span class="num">1.4</span>日间 / 夜间亮度</h3>
+<p>原「起始亮度 / 结束亮度」改为 <strong>日间亮度 / 夜间亮度</strong>，并与时间同行双列排布：</p>
+<pre><code>开始时间  08:00  −  +      日间亮度  80%  −  +
+结束时间  18:00  −  +      夜间亮度  20%  −  +</code></pre>
+<p>新增配置 <code>DayPct</code> / <code>NightPct</code>（默认 80 / 20），时间步进 ±1 小时，亮度步进 ±5%。</p>
+
+<h3><span class="num">1.5</span>HDR 基准亮度标定</h3>
+<p>托盘菜单新增「标定 HDR 基准亮度」：读取 Windows「SDR 内容亮度」滑条最右端对应的白电平，存入 <code>WlMax</code>（本机标定值约 3850）。同时新增「校准滚轮图标位置」，记录托盘图标的实际屏幕坐标（<code>TrayX</code> / <code>TrayY</code>），供滚轮命中判定使用。</p>
+
+<h3><span class="num">1.6</span>面板位置记忆</h3>
+<p>拖动面板后，进入设置页再返回不再跳回右下角默认位置。实现：拖动结束（<code>WM_EXITSIZEMOVE</code>）记录左上角并置 <code>g_moved</code>；<code>PlacePanel()</code> 优先使用该坐标，仅在新页高越出工作区时向上收回；关闭面板时清空记录。</p>
+
+<h3><span class="num">1.7</span>HDR 遮罩调光</h3>
+<p>HDR 显示器固件锁死 DDC 亮度寄存器时，新增第二级调光：每屏一个黑色分层窗口，通过 <code>SetLayeredWindowAttributes</code> 调节不透明度，与 gamma LUT 叠加使用（详见 2.4）。</p>
+
+<h3><span class="num">1.8</span>HDR 提示行双读数</h3>
+<p>HDR 激活时，面板提示行同时显示两层亮度：</p>
+<pre><code>Windows 白电平 2700 · lumen 调光 42%</code></pre>
+<p>前者通过目标通道的 SDR 白电平查询读取（随 3 秒 HDR 轮询刷新），实时镜像系统设置里的「SDR 内容亮度」滑条；后者是 lumen 自己的相对调光。两个数字是不同维度（基准白电平 vs 相对压暗），不是同一控件的两份副本。</p>
+<p class="note">之所以分两处显示而不是合并成一个数：实测不存在可写的 SDR 白电平通道（<code>DisplayConfig</code> 类型 14–64、两种结构体尺寸、target/source id 全部试过，另做了全量 VCP 扫描），无法通过公开接口与系统滑条统一。双读数是这个问题下唯一如实的呈现方式。</p>
+
+<h2 id="improve">二、行为改进</h2>
+
+<h3><span class="num">2.1</span>自动调节改为两段渐变</h3>
+<table>
+  <tr><th style="width:26%"></th><th>1.2.1</th><th>现在</th></tr>
+  <tr><td>曲线</td><td>起止时间之间线性插值 25–100%</td><td>两个端点各做 8 分钟渐变</td></tr>
+  <tr><td>端点</td><td>无独立亮度</td><td>日间 / 夜间可分别设置</td></tr>
+  <tr><td>生效时机</td><td>开关打开后等下一次定时器（最多 60 秒）</td><td>开关打开立即按当前时间计算</td></tr>
+</table>
+<p>渐变时间固定 8 分钟（落在 5–10 分钟区间）：到开始时间升到日间亮度，白天保持；到结束时间降到夜间亮度，夜间保持。</p>
+
+<h3><span class="num">2.2</span>托盘滚轮改 Raw Input</h3>
+<p>Windows 11 不再向托盘图标转发 <code>WM_MOUSEWHEEL</code>，原实现依赖 explorer 转发，在新系统上失效。改为 <code>RegisterRawInputDevices</code> + <code>WM_INPUT</code> 直接接收鼠标滚轮，用光标位置判断是否落在托盘图标邻域。</p>
+
+<h3><span class="num">2.3</span>滚轮跟手</h3>
+<p>原实现把 160 ms 内的滚动累积后一次性应用，并把结果钳制在 ±2 步——快速滚 5 格只涨 2 步、且要停手才跳数。</p>
+<p>现在按 <code>delta / 120 × 步长</code> 即时计算并立即更新数值、弹 OSD；写入频率仍由后台写入线程合并，不受影响。高精度滚轮（<code>delta &lt; 120</code>）兜底 ±1。</p>
+
+<h3><span class="num">2.4</span>HDR 调光改为 10% 两段式</h3>
+<table>
+  <tr><th style="width:24%">区间</th><th>通路</th></tr>
+  <tr><td>10% ~ 100%</td><td>纯 gamma LUT：<code>scale = (目标 ÷ baseL)^(1/2.2)</code>，遮罩 alpha = 0</td></tr>
+  <tr><td>0% ~ 10%</td><td>gamma 锁在 10% 处的基准值，遮罩 alpha 从 0 线性加深到 94（透光 6%）</td></tr>
+</table>
+<p>两段在 10% 处亮度连续。原实现的分界是 gamma 系数 0.5，与百分比无固定对应关系。</p>
+<p>配套三项稳定性改造：</p>
+<ul>
+  <li>原始 LUT 按屏备份（含校色曲线），写入时在备份上乘系数，退出时写回；启动发现中点明显偏暗（上次被强杀）先归一</li>
+  <li>每次写 LUT 后读回比对，连续两次不符判定该环境不可用，自动降级为全区间遮罩</li>
+  <li>写入改在后台写入线程同步执行（异步子线程会造成写入错序），DC 缓存复用，启动预热</li>
+</ul>
+
+<h3><span class="num">2.5</span>熄屏恢复判据</h3>
+<p>原判据用「最后一次输入时间是否晚于熄屏时刻」；改为比对熄屏瞬间记录的基线时间戳是否发生变化。</p>
+
+<h2 id="fix">三、修复</h2>
+<table>
+  <tr><th style="width:24%">问题</th><th style="width:34%">原因</th><th>处理</th></tr>
+  <tr><td>熄屏后立刻自己亮回来</td><td>按钮点击本身被算作新输入，800 ms 宽限一过就触发恢复</td><td>基线时间戳 + 3 秒吸收窗口（1.2 / 2.5）</td></tr>
+  <tr><td>HDR 下调光不跟手、数值错乱</td><td>gamma 写入在独立线程中异步执行，先后顺序无法保证；DC 反复创建销毁会卡住</td><td>同步写入 + DC 缓存 + 读回校验降级（2.4）</td></tr>
+  <tr><td>切设置页 / 返回时面板跳回右下角</td><td><code>PlacePanel()</code> 每次按默认位置重算</td><td>拖动后记住左上角（1.6）</td></tr>
+  <tr><td>任务管理器里找不到进程</td><td>「名称」列显示版本资源的 <code>FileDescription</code>，原值 <code>lumen brightness control</code></td><td>改为 <code>lumen</code>，与程序名一致</td></tr>
+  <tr><td>设置页时间值折行</td><td>40 px 宽、13 px 加粗的 <code>08:00</code> 被 GDI+ 折成两行</td><td>降至 12 px，单行显示</td></tr>
+</table>
+
+<h2 id="tools">四、工程与工具</h2>
+<p>新增 5 个回归 / 诊断工具（独立 exe，静态链接，不参与主程序）：</p>
+<table>
+  <tr><th style="width:24%">工具</th><th>用途</th></tr>
+  <tr><td><code>vcp.cpp</code></td><td>读写任意 DDC/CI 寄存器（<code>0xD6</code> 电源、<code>0x10</code> 亮度），验证固件是否支持</td></tr>
+  <tr><td><code>sdrwl.cpp</code></td><td>读写 Windows SDR 白电平，用于确认系统是否允许应用修改</td></tr>
+  <tr><td><code>dimstate.cpp</code></td><td>读取当前 gamma LUT 中点值与遮罩 alpha，验证两级调光实际状态</td></tr>
+  <tr><td><code>movepanel.cpp</code></td><td>移动面板窗口并模拟拖动结束，验证位置记忆</td></tr>
+  <tr><td><code>resmon.cpp</code></td><td>采样进程 CPU / 工作集 / 私有提交 / 句柄 / 线程 / GDI+USER 对象</td></tr>
+</table>
+<p>另归档 <code>perf/</code> 目录：8 个场景的资源采样 CSV（待机、面板静止、拖动、开合切页两轮、快捷键、熄屏恢复、冷启动）。</p>
+
+<h2 id="config">五、配置项变化</h2>
+<p><code>HKCU\Software\lumen</code> 新增 7 项：</p>
+<table>
+  <tr><th style="width:26%">键</th><th>含义</th><th style="width:20%">默认</th></tr>
+  <tr><td><code>DayPct</code></td><td>日间亮度</td><td class="num">80</td></tr>
+  <tr><td><code>NightPct</code></td><td>夜间亮度</td><td class="num">20</td></tr>
+  <tr><td><code>WheelTray</code></td><td>托盘图标上滚轮调节</td><td class="num">1</td></tr>
+  <tr><td><code>WheelPanel</code></td><td>面板打开时滚轮调节</td><td class="num">1</td></tr>
+  <tr><td><code>WlMax</code></td><td>标定得到的 SDR 白电平上限</td><td class="num">0（未标定）</td></tr>
+  <tr><td><code>TrayX</code> / <code>TrayY</code></td><td>托盘图标屏幕坐标（滚轮命中判定）</td><td class="num">未记录</td></tr>
+</table>
+<p>原有 16 项键名与含义未变，升级无需迁移。</p>
+
+<h2 id="limits">六、已知边界</h2>
+<ol>
+  <li><strong>HDR 下 gamma LUT 不保证可用。</strong>本机实测 <code>SetDeviceGammaRamp</code> 写入后读回不符，程序会自动降级为全区间遮罩——亮度仍跟手、极暗可到 6% 透光，但 HDR 高光会被一起压暗。</li>
+  <li><strong><code>SET_SDR_WHITE_LEVEL</code> 被系统拒绝。</strong>实测返回 87（参数无效），可读不可写。方案一只能走 gamma LUT，不能改系统全局白电平。</li>
+  <li><strong>熄屏是软关。</strong><code>0xD6=4</code> 让显示器进待机，DDC 通道保留、任意输入可唤醒；想要电源灯全灭只能硬关（<code>0xD6=5</code>，部分固件会断 DDC，需按物理电源键）。</li>
+  <li><strong>自动调节不支持跨午夜。</strong>结束时间必须晚于开始时间，按小时步进。</li>
+  <li><strong>熄屏兜底会关全部屏。</strong><code>SC_MONITORPOWER</code> 是系统级广播，无法只关一台。</li>
+</ol>
+
+<h2 id="files">七、文件清单</h2>
+<table>
+  <tr><th style="width:36%">文件</th><th>变更</th></tr>
+  <tr><td><code>src/lumen.cpp</code></td><td class="num">+845 / −80</td></tr>
+  <tr><td><code>README.md</code></td><td class="num">+22 / −8</td></tr>
+  <tr><td><code>lumen.rc</code></td><td>版本 1.2.2、<code>FileDescription</code> 改名</td></tr>
+  <tr><td><code>tools/vcp.cpp</code></td><td>新增（1,899 字节）</td></tr>
+  <tr><td><code>tools/sdrwl.cpp</code></td><td>新增（2,057 字节）</td></tr>
+  <tr><td><code>tools/dimstate.cpp</code></td><td>新增（1,193 字节）</td></tr>
+  <tr><td><code>tools/movepanel.cpp</code></td><td>新增（724 字节）</td></tr>
+  <tr><td><code>tools/resmon.cpp</code></td><td>新增（5,188 字节）</td></tr>
+  <tr><td><code>perf/*.csv</code></td><td>新增：8 个场景的资源采样数据</td></tr>
+</table>
+
+<h2 id="resbench">八、资源占用实测对比（resmon 同尺）</h2>
+<p>从 1.2.1 发布源码独立编译基线（398 KB），与当前版本同机背靠背采样（<code>tools/resmon</code>，500ms × 16–30 次）：</p>
+<table>
+  <tr><th>状态</th><th>指标</th><th>1.2.1</th><th>当前</th><th>变化</th></tr>
+  <tr><td>exe 体积</td><td>字节</td><td>398,336</td><td>429,568</td><td>+31 KB（+7.8%）</td></tr>
+  <tr><td rowspan="5">托盘常驻（空闲 15s）</td><td>私有内存</td><td>3,216 KB</td><td>3,216 KB</td><td>±0</td></tr>
+  <tr><td>句柄</td><td>250</td><td>250</td><td>±0</td></tr>
+  <tr><td>线程</td><td>10</td><td>10</td><td>±0</td></tr>
+  <tr><td>GDI / USER 对象</td><td>11 / 13</td><td>12 / 14</td><td>+1 / +1</td></tr>
+  <tr><td>CPU</td><td>0.00%</td><td>0.00%</td><td>—</td></tr>
+  <tr><td rowspan="3">面板打开（稳态）</td><td>私有内存</td><td>4,840 KB</td><td>4,780 KB</td><td>−60 KB</td></tr>
+  <tr><td>句柄</td><td>292</td><td>292</td><td>±0</td></tr>
+  <tr><td>GDI / USER 对象</td><td>14 / 25</td><td>15 / 26</td><td>+1 / +1</td></tr>
+</table>
+<p>结论：+774 行、23 项功能增强后，两个常态的资源占用与 1.2.1 <strong>持平</strong>；唯一增量是 exe 体积 +31 KB 与 GDI/USER 各 +1 个对象。数据归档：<code>perf/res_cmp_*.csv</code>。</p>
+
+<footer>
+  lumen 1.3.0 · Win32 + GDI+ · MIT License<br>
+  本说明依据源码逐符号比对与实测数据整理，差异统计来自 <code>git diff 6c8a178 -- src/lumen.cpp README.md lumen.rc</code>。
+</footer>
+
+</main>
+</body>
+</html>
