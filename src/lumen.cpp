@@ -48,7 +48,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_DIM     (WM_APP + 8)   // wParam = dev string (heap), lParam = 遮罩黑度 0-85
 #define WM_WLCAL   (WM_APP + 9)   // wParam = 标定得到的滑条最大白电平（0 = 失败）
 
-#define APP_VERSION L"1.3.1"
+#define APP_VERSION L"1.3.2"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
@@ -117,7 +117,7 @@ static int  g_page = 0;   // 0 主面板 1 设置页
 static bool g_wantSettings = false;   // 首次建窗时直接进设置页
 
 // 设置页比主面板高（容纳「鼠标设置」分组）；建窗与 PlacePanel 按当前页取高，底部锚点不变
-static const int SET_PAGE_H = 700;
+static const int SET_PAGE_H = 750;   // 容纳鼠标与键盘分组的三行开关
 // 校准页（单屏偏移）高度：标题区 + 每屏一行 + 归零行；最少 400，避免大面积留白
 static int CalibPageH() {
     int h = 182 + (int)g_mons.size() * 52;
@@ -159,6 +159,8 @@ static const float UI_SCALE = 0.86f;
 static int g_lang = 0;
 static int g_step = 5;       // 滚轮/热键步长，可调 1/2/5/10
 static int g_wheelTray = 1, g_wheelPanel = 1;   // 鼠标设置：托盘图标 / 打开面板时滚轮调节亮度
+static int g_keyBright = 0;                     // 键盘 HID 亮度键（Consumer 0x6F/0x70），默认关
+static unsigned long long g_lastKeyTick = 0;    // 亮度键去抖（按住键 auto-repeat ~30/s）
 static int g_gammaDim = 0;   // 软件调光：HDR 固件锁 DDC 亮度时的 gamma 回退通路
 static std::atomic<float> g_baseL{1.f};   // 仅供提示/诊断：当前白电平 ÷ 标定最大值（1 = 未标定 / 滑条最右）
 static DWORD g_dispChangeTick = 0;        // 最近一次显示模式切换（HDR 开关等）
@@ -177,7 +179,7 @@ enum {
     S_HOTKEYS, S_UP, S_DOWN, S_SHOWPILL, S_PRESSKEY, S_OCCUPIED, S_NEEDMOD, S_MODIFY, S_CANCEL, S_SIG,
     S_SHOWPANEL, S_BRIGHTUP, S_BRIGHTDN, S_DIAG, S_EXIT, S_LANG, S_GAMMA,
     S_OCCUPFMT, S_UPDATEFMT, S_HDR, S_DAYBR, S_NIGHTBR,
-    S_MOUSESET, S_WHEELTRAY, S_WHEELPANEL,
+    S_MOUSESET, S_WHEELTRAY, S_WHEELPANEL, S_KEYBRIGHT,
     S_RESTOFF, S_RESTON,
     S_CAL, S_CALDONE, S_CALFAIL, S_CALIB, S_CALIBHINT, S_CALDONE2,
     S_OFFPG, S_OFFHINT, S_OFFRESET,
@@ -197,7 +199,7 @@ static const wchar_t* const STR_CN[S_COUNT] = {
     L"%ls %ls：组合被占用", L"lumen 有新版本 %ls\nhttps://github.com/iosvcnm/lumen/releases/latest",
     L" · HDR",
     L"日间亮度", L"夜间亮度",
-    L"鼠标设置", L"托盘图标上滚轮调节亮度", L"面板打开时滚轮调节亮度",
+    L"鼠标与键盘", L"托盘图标上滚轮调节亮度", L"面板打开时滚轮调节亮度", L"键盘亮度键（亮度 +/−）",
     L"屏幕已关闭", L"屏幕已恢复",
     L"标定 HDR 基准亮度", L"标定完成：基准 %lu", L"标定失败：请先拖动「SDR 内容亮度」滑条",
     L"校准滚轮图标位置", L"请点击任务栏上的 lumen 图标", L"已记录滚轮位置 (%d,%d)",
@@ -217,7 +219,8 @@ static const wchar_t* const STR_EN[S_COUNT] = {
     L"%ls %ls: combo occupied", L"lumen %ls is available\nhttps://github.com/iosvcnm/lumen/releases/latest",
     L" · HDR",
     L"Day brightness", L"Night brightness",
-    L"Mouse", L"Wheel on tray icon adjusts brightness", L"Wheel in panel adjusts brightness",
+    L"Mouse & keyboard", L"Wheel on tray icon adjusts brightness", L"Wheel in panel adjusts brightness",
+    L"Keyboard brightness keys",
     L"Screen is off", L"Screen restored",
     L"Calibrate HDR base brightness", L"Calibration done: base %lu", L"Calibration failed: drag the SDR content brightness slider",
     L"Calibrate wheel icon position", L"Click the lumen icon on the taskbar", L"Wheel position recorded (%d,%d)",
@@ -301,6 +304,7 @@ static void LoadConfig() {
     g_gammaDim = RegGet(L"GammaDim", 0);
     g_wheelTray  = RegGet(L"WheelTray", 1) ? 1 : 0;
     g_wheelPanel = RegGet(L"WheelPanel", 1) ? 1 : 0;
+    g_keyBright  = RegGet(L"KeyBright", 0) ? 1 : 0;
     g_wlMax = RegGet(L"WlMax", 0);
     { int tx = RegGet(L"TrayX", -1), ty = RegGet(L"TrayY", -1);
       if (tx >= 0 && ty >= 0) { g_iconPt = POINT{tx, ty}; g_iconHover = true; } }
@@ -1648,9 +1652,9 @@ static void CopyDiagnostics() {
     if (g_mons.empty()) g_mons = Scan();
     std::wstring t = std::wstring(L"lumen ") + APP_VERSION;
     wchar_t b[320];
-    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d gamma=%d wheel=%d/%d",
+    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d gamma=%d wheel=%d/%d key=%d",
              g_lang, g_cfgTheme, g_step, g_cfgDelay, g_cfgAuto, g_cfgStartH, g_cfgEndH,
-             g_cfgStart, g_gammaDim, g_wheelTray, g_wheelPanel);
+             g_cfgStart, g_gammaDim, g_wheelTray, g_wheelPanel, g_keyBright);
     t += b;
     swprintf(b, 320, L"\r\nhotkeys: up=%ls down=%ls show=%ls",
              HotkeyText(g_hkUpMod, g_hkUpVk).c_str(),
@@ -2181,28 +2185,64 @@ static void PlacePanel() {
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
-    BindRound(g_hwnd, w, h, 34, UI_SCALE);
+    // 分层窗口呈现（PresentPanel），无需 region 裁剪；圆角由 alpha 抗锯齿
     if (g_moved) { g_movedPos.x = x; g_movedPos.y = y; }   // 收回后同步，连续切页不漂移
 }
 
+static void PresentPanel(HWND hwnd);   // 定义在下方
+
 static void OnPanelPaint(HWND hwnd) {
     PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
+    BeginPaint(hwnd, &ps);
+    EndPaint(hwnd, &ps);      // ULW 模式：WM_PAINT 只负责清无效区，内容由 PresentPanel 呈现
+    PresentPanel(hwnd);
+}
+
+// 面板呈现：GDI+ 绘制进 PARGB 缓冲（premultiplied alpha），经 UpdateLayeredWindow 整窗呈现。
+// 圆角边缘走 alpha 渐变，彻底替代 SetWindowRgn 裁剪（region 无抗锯齿，四角有锯齿）。
+static void PresentPanel(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    if (w <= 0 || h <= 0) return;
 
-    Bitmap buf(rc.right, rc.bottom, PixelFormat32bppPARGB);
+    Bitmap buf(w, h, PixelFormat32bppPARGB);
     Graphics g(&buf);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     float k = g_dpi / 96.0f * UI_SCALE;
     g.ScaleTransform(k, k);
     // 逻辑尺寸由实际客户区反推：设置页比主面板高，窗口随页面切换加高/复原
-    DrawPanel(g, (int)lroundf(rc.right / k), (int)lroundf(rc.bottom / k));
+    DrawPanel(g, (int)lroundf(w / k), (int)lroundf(h / k));
 
-    Graphics dst(hdc);
-    dst.DrawImage(&buf, 0, 0);
-    EndPaint(hwnd, &ps);
+    BitmapData bd{};
+    Rect full(0, 0, w, h);
+    if (buf.LockBits(&full, ImageLockModeRead, PixelFormat32bppPARGB, &bd) != Ok) return;
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;              // top-down 与 GDI+ 行序一致
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC hdcScreen = GetDC(hwnd);
+    HDC mem = CreateCompatibleDC(hdcScreen);
+    HBITMAP dib = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (dib && bits) {
+        memcpy(bits, bd.Scan0, (size_t)w * h * 4);
+        HGDIOBJ old = SelectObject(mem, dib);
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        POINT src{ 0, 0 };
+        SIZE size{ w, h };
+        UpdateLayeredWindow(hwnd, hdcScreen, nullptr, &size, mem, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mem, old);
+        DeleteObject(dib);
+    }
+    DeleteDC(mem);
+    ReleaseDC(hwnd, hdcScreen);
+    buf.UnlockBits(&bd);
 }
 
 // ---------------------------------------------------------------- OSD
@@ -2467,6 +2507,8 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
     g.DrawString(tr(S_WHEELPANEL), -1, &fl, PointF(SET_L, SetMouseRowY(1)), &tb);
     ToggleTrack(g, SetMouseToggleRect(0).X, SetMouseToggleRect(0).Y, g_wheelTray != 0, g_dark);
     ToggleTrack(g, SetMouseToggleRect(1).X, SetMouseToggleRect(1).Y, g_wheelPanel != 0, g_dark);
+    g.DrawString(tr(S_KEYBRIGHT), -1, &fl, PointF(SET_L, SetMouseRowY(2)), &tb);
+    ToggleTrack(g, SetMouseToggleRect(2).X, SetMouseToggleRect(2).Y, g_keyBright != 0, g_dark);
 
     SolidBrush eb(g_pal.danger);
     SolidBrush* msgBrush = &sb;
@@ -2911,6 +2953,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (InRect(SetMouseToggleRect(2), x, y)) {
+                g_keyBright = g_keyBright ? 0 : 1;
+                RegPut(L"KeyBright", g_keyBright);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             for (int i = 2; i <= 3; ++i) {
                 bool tminus = InRect(SetTimeMinusRect(i), x, y);
                 bool tplus  = InRect(SetTimePlusRect(i), x, y);
@@ -3065,9 +3113,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT* r = (RECT*)lp;
         SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        RECT rc; GetClientRect(hwnd, &rc);
-        BindRound(hwnd, rc.right, rc.bottom, 34, UI_SCALE);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        InvalidateRect(hwnd, nullptr, FALSE);   // 分层窗口：内容随 PresentPanel 重呈现，无需 region
         return 0;
     }
     case WM_DISPLAYCHANGE:
@@ -3146,7 +3192,9 @@ static void AddTray() {
     // 托盘滚轮走 Raw Input（EarTrumpet 同款）：Win11 不向溢出面板图标转发 WM_MOUSEWHEEL，
     // 但原始输入直达本进程，配合图标矩形命中即可，无需 explorer 参与。幂等注册。
     // 同时注册键盘：熄屏状态下按键也能收到，用于唤醒恢复。
-    RAWINPUTDEVICE rid[2]{};
+    // Consumer Control（0x0C/0x01）：键盘亮度键 0x006F/0x0070，Win11 不写外接屏 DDC，
+    // 由 lumen 接管（GitHub issue #2）；其余 consumer 键（音量等）忽略，RIDEV_INPUTSINK 不吞键。
+    RAWINPUTDEVICE rid[3]{};
     rid[0].usUsagePage = 0x01;          // generic desktop
     rid[0].usUsage = 0x02;              // mouse
     rid[0].dwFlags = RIDEV_INPUTSINK;   // 无焦点也接收
@@ -3155,7 +3203,11 @@ static void AddTray() {
     rid[1].usUsage = 0x06;              // keyboard
     rid[1].dwFlags = RIDEV_INPUTSINK;   // 无焦点也接收，不吞键，热键不受影响
     rid[1].hwndTarget = g_msg;
-    RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
+    rid[2].usUsagePage = 0x0C;
+    rid[2].usUsage = 0x01;              // consumer control
+    rid[2].dwFlags = RIDEV_INPUTSINK;
+    rid[2].hwndTarget = g_msg;
+    RegisterRawInputDevices(rid, 3, sizeof(RAWINPUTDEVICE));
 }
 
 // 图标当前屏幕矩形：固定在任务栏 = 常有；在溢出面板 = 仅面板展开时可见。
@@ -3195,7 +3247,7 @@ static void ShowPanel() {
             g_val = n ? sum / n : 50;
         }
         g_dpi = 96;
-        g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPanelClass, L"lumen",
+        g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kPanelClass, L"lumen",
             WS_POPUP, 0, 0, (int)(Scale(PANEL_W) * UI_SCALE), (int)(Scale(PageH()) * UI_SCALE),
             nullptr, nullptr, g_inst, nullptr);
         if (!g_hwnd) return;
@@ -3516,6 +3568,24 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         ShowOsd();
                     }
                 }
+            } else if (ri->header.dwType == RIM_TYPEHID && g_keyBright) {
+                // 键盘亮度键（Consumer 0x006F 亮度+ / 0x0070 亮度−）：报告 = report ID + 16 位小端用法码，
+                // 不同键盘 report ID/布局不同，按 16 位窗口扫描匹配，不依赖固定偏移
+                unsigned long long now = GetTickCount64();
+                if (now - g_lastKeyTick >= 160) {          // 去抖：按住键 auto-repeat ~30/s，否则 OSD/写入被刷爆
+                    const BYTE* rep = ri->data.hid.bRawData;
+                    UINT len = ri->data.hid.dwSizeHid * ri->data.hid.dwCount;
+                    if (len > 64) len = 64;                // consumer 报告极小；缓冲 256 字节，bRawData 偏移 <32，安全
+                    for (UINT i = 0; i + 1 < len; ++i) {
+                        UINT16 u = (UINT16)rep[i] | ((UINT16)rep[i + 1] << 8);
+                        if (u == 0x006F || u == 0x0070) {
+                            g_lastKeyTick = now;
+                            Adjust(u == 0x006F ? g_step : -g_step);
+                            ShowOsd();
+                            break;
+                        }
+                    }
+                }
             }
         }
         return 0;
@@ -3758,6 +3828,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&m);
     }
 
+    // 退出清理限时看门狗：清理段若卡死（驱动/DDC/GDI），3 秒后强制终结。
+    // issue #1：v1.3.0 阻塞式 DDC 写入卡死 Writer，退出 join 永久等待 → 托盘已删、
+    // 无窗口无界面，只剩「空线程进程」残留。看门狗保证任何卡死路径都不会留下进程。
+    auto cleanupDone = std::make_shared<std::atomic<bool>>(false);
+    std::thread([cleanupDone]() {
+        for (int i = 0; i < 30 && !cleanupDone->load(); ++i) Sleep(100);
+        if (!cleanupDone->load()) TerminateProcess(GetCurrentProcess(), 0);
+    }).detach();
+
     g_writer.Stop();
     RestoreRampsAll();       // 退出：把备份的原始 gamma LUT 写回
     OverlayCloseAll();
@@ -3770,5 +3849,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (g_icon) DestroyIcon((HICON)g_icon);
     GdiplusShutdown(tok);
     CoUninitialize();
+    cleanupDone->store(true);
     return 0;
 }
