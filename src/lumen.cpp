@@ -1815,17 +1815,35 @@ static void DrawSettingsPage(Graphics& g, int W, int H);
 static void DrawCalibPage(Graphics& g, int W, int H);
 static void DrawMonitorMenu(Graphics& g, int W, int H);
 
+// 卡片内投影：沿四边的暗角渐变，增强悬浮层次。分层窗口下卡片外全透明，
+// 层次只能画在卡片内；四角两方向渐变交叉形成自然暗角。
+static void CardInsetShadow(Graphics& g, int W, int H) {
+    GraphicsPath edge;
+    RoundRect(edge, RectF(0, 0, (float)W, (float)H), 40.f);
+    Region rgn(&edge);
+    g.SetClip(&rgn);
+    BYTE a = g_dark ? 55 : 40;
+    LinearGradientBrush t(PointF(0, 0), PointF(0, 14.f), Color(a, 10, 14, 24), Color(0, 10, 14, 24));
+    g.FillRectangle(&t, 0.f, 0.f, (float)W, 14.f);
+    LinearGradientBrush b(PointF(0, (float)H), PointF(0, (float)H - 14), Color(a, 10, 14, 24), Color(0, 10, 14, 24));
+    g.FillRectangle(&b, 0.f, (float)H - 14.f, (float)W, 14.f);
+    LinearGradientBrush l(PointF(0, 0), PointF(14, 0), Color(a, 10, 14, 24), Color(0, 10, 14, 24));
+    g.FillRectangle(&l, 0.f, 0.f, 14.f, (float)H);
+    LinearGradientBrush r(PointF((float)W, 0), PointF((float)W - 14, 0), Color(a, 10, 14, 24), Color(0, 10, 14, 24));
+    g.FillRectangle(&r, (float)W - 14.f, 0.f, 14.f, (float)H);
+    g.ResetClip();
+}
+
 static void DrawPanel(Graphics& g, int W, int H) {
     if (g_page == 1) { DrawSettingsPage(g, W, H); return; }
     if (g_page == 2) { DrawCalibPage(g, W, H); return; }
     LinearGradientBrush bg(PointF(0, 0), PointF((float)W, (float)H), g_pal.bg1, g_pal.bg2);
-    // 窗口 RGN 圆角与卡片抗锯齿圆角曲线不重合，先整体铺底色，避免四角露出未绘制的黑底
-    g.FillRectangle(&bg, -2.f, -2.f, (float)W + 4, (float)H + 4);
     GraphicsPath card;
-    RoundRect(card, RectF(0, 0, (float)W, (float)H), 34.f);
+    RoundRect(card, RectF(0, 0, (float)W, (float)H), 40.f);
     g.FillPath(&bg, &card);
     Pen border(g_pal.border, 1.f);
     g.DrawPath(&border, &card);
+    CardInsetShadow(g, W, H);
 
     StringFormat sf;
     sf.SetAlignment(StringAlignmentCenter);
@@ -2396,14 +2414,14 @@ static bool InRect(const RectF& r, int x, int y) {
 }
 
 static void DrawSettingsPage(Graphics& g, int W, int H) {
-    // 与主面板完全同源的卡片：同一渐变、同一 34 px 圆角、同一描边
+    // 与主面板完全同源的卡片：同一渐变、同一 40 px 圆角、同一描边、同一内投影
     LinearGradientBrush bg(PointF(0, 0), PointF(0, (float)H), g_pal.bg1, g_pal.bg2);
-    g.FillRectangle(&bg, -2.f, -2.f, (float)W + 4, (float)H + 4);   // 铺底防黑角
     GraphicsPath card;
-    RoundRect(card, RectF(0, 0, (float)W, (float)H), 34.f);
+    RoundRect(card, RectF(0, 0, (float)W, (float)H), 40.f);
     g.FillPath(&bg, &card);
     Pen border(g_pal.pillEdge, 1.f);
     g.DrawPath(&border, &card);
+    CardInsetShadow(g, W, H);
 
     SolidBrush tb(g_pal.text);
     SolidBrush sb(g_pal.sub);
@@ -2530,14 +2548,14 @@ static RectF  CalPlusRect(int i)  { return RectF(334.f, CalRowY(i) - 4.f, 30.f, 
 static RectF  CalResetRect()      { return RectF(SET_L, CalRowY((int)g_mons.size()) + 2.f, 130.f, 30.f); }
 
 static void DrawCalibPage(Graphics& g, int W, int H) {
-    // 与设置页完全同源的卡片：同一渐变、同一 34 px 圆角、同一描边
+    // 与设置页完全同源的卡片：同一渐变、同一 40 px 圆角、同一描边、同一内投影
     LinearGradientBrush bg(PointF(0, 0), PointF(0, (float)H), g_pal.bg1, g_pal.bg2);
-    g.FillRectangle(&bg, -2.f, -2.f, (float)W + 4, (float)H + 4);   // 铺底防黑角
     GraphicsPath card;
-    RoundRect(card, RectF(0, 0, (float)W, (float)H), 34.f);
+    RoundRect(card, RectF(0, 0, (float)W, (float)H), 40.f);
     g.FillPath(&bg, &card);
     Pen border(g_pal.pillEdge, 1.f);
     g.DrawPath(&border, &card);
+    CardInsetShadow(g, W, H);
 
     SolidBrush tb(g_pal.text);
     SolidBrush sb(g_pal.sub);
