@@ -48,7 +48,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_DIM     (WM_APP + 8)   // wParam = dev string (heap), lParam = 遮罩黑度 0-85
 #define WM_WLCAL   (WM_APP + 9)   // wParam = 标定得到的滑条最大白电平（0 = 失败）
 
-#define APP_VERSION L"1.3.0"
+#define APP_VERSION L"1.3.1"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
@@ -89,7 +89,8 @@ static int       g_menuHover = -1;
 static HANDLE    g_icon = nullptr;
 
 struct Mon {
-    std::wstring dev;
+    std::wstring dev;      // 写入分流用的设备名：DDC 屏为 \\.\DISPLAYn，内置屏为伪名 WMI
+    std::wstring gdiDev;   // 真实 GDI 设备名；WMI 条目由 RefreshHdrFlags 反查内置面板路径
     std::wstring key;      // 稳定标识：显示器设备接口路径，跨重启不变
     std::wstring name;
     bool controllable = false;
@@ -98,6 +99,7 @@ struct Mon {
     bool hdr = false;      // Windows 高级色 HDR 激活（OSD 硬件 HDR 检测不到）
     ULONG sdrwl = 0;       // Windows SDR 内容白电平（HDR 激活时可读，随滑条变化）
     int  pct = 50;
+    int  off = 0;          // 单屏偏移（-25..25，仅「全部显示器」同步时叠加）
     DWORD mn = 0, mx = 100;
 };
 
@@ -116,7 +118,14 @@ static bool g_wantSettings = false;   // 首次建窗时直接进设置页
 
 // 设置页比主面板高（容纳「鼠标设置」分组）；建窗与 PlacePanel 按当前页取高，底部锚点不变
 static const int SET_PAGE_H = 700;
-static int PageH() { return g_page == 1 ? SET_PAGE_H : PANEL_H; }
+// 校准页（单屏偏移）高度：标题区 + 每屏一行 + 归零行；最少 400，避免大面积留白
+static int CalibPageH() {
+    int h = 182 + (int)g_mons.size() * 52;
+    return std::max(400, h);
+}
+static int PageH() {
+    return g_page == 1 ? SET_PAGE_H : (g_page == 2 ? CalibPageH() : PANEL_H);
+}
 static UINT g_hkUpMod = MOD_CONTROL, g_hkUpVk = VK_PRIOR;
 static UINT g_hkDownMod = MOD_CONTROL, g_hkDownVk = VK_NEXT;
 static UINT g_hkShowMod = MOD_CONTROL | MOD_ALT, g_hkShowVk = 'B';
@@ -151,10 +160,11 @@ static int g_lang = 0;
 static int g_step = 5;       // 滚轮/热键步长，可调 1/2/5/10
 static int g_wheelTray = 1, g_wheelPanel = 1;   // 鼠标设置：托盘图标 / 打开面板时滚轮调节亮度
 static int g_gammaDim = 0;   // 软件调光：HDR 固件锁 DDC 亮度时的 gamma 回退通路
-static std::atomic<float> g_baseL{1.f};   // Windows 基准亮度系数（1 = 滑条最右 / 未标定）
+static std::atomic<float> g_baseL{1.f};   // 仅供提示/诊断：当前白电平 ÷ 标定最大值（1 = 未标定 / 滑条最右）
 static DWORD g_dispChangeTick = 0;        // 最近一次显示模式切换（HDR 开关等）
-static std::atomic<bool> g_clamped{false};  // pct 超过 Windows 基准被钳制（提示用户拉高滑条）
 static std::atomic<bool> g_gammaDead{false}; // HDR 下 gamma LUT 不生效（读回校验失败）→ 全区间遮罩
+static std::atomic<bool> g_hdrAny{false};    // 任一活动显示路径处于 Windows HDR（屏被 Scan 丢弃时兜底）
+static std::atomic<ULONG> g_hdrAnyWl{0};    // 上述路径的 SDR 白电平（提示行 / 基准补偿兜底）
 static POINT g_iconPt{};                    // 托盘图标实时位置（悬停时由 WM_MOUSEMOVE 更新）
 static bool g_iconHover = false;            // 是否已获得图标位置（获得后滚轮判定收窄到图标邻域）
 static bool g_calibrating = false;          // 校准中：下一次托盘左键点击记录图标位置
@@ -170,6 +180,7 @@ enum {
     S_MOUSESET, S_WHEELTRAY, S_WHEELPANEL,
     S_RESTOFF, S_RESTON,
     S_CAL, S_CALDONE, S_CALFAIL, S_CALIB, S_CALIBHINT, S_CALDONE2,
+    S_OFFPG, S_OFFHINT, S_OFFRESET,
     S_COUNT
 };
 static const wchar_t* const STR_CN[S_COUNT] = {
@@ -190,6 +201,7 @@ static const wchar_t* const STR_CN[S_COUNT] = {
     L"屏幕已关闭", L"屏幕已恢复",
     L"标定 HDR 基准亮度", L"标定完成：基准 %lu", L"标定失败：请先拖动「SDR 内容亮度」滑条",
     L"校准滚轮图标位置", L"请点击任务栏上的 lumen 图标", L"已记录滚轮位置 (%d,%d)",
+    L"单屏偏移", L"只影响「全部显示器」同步；单屏直接调节不偏移", L"全部归零",
 };
 static const wchar_t* const STR_EN[S_COUNT] = {
     L"Brightness", L"Theme", L"Auto", L"Light", L"Dark",
@@ -209,6 +221,8 @@ static const wchar_t* const STR_EN[S_COUNT] = {
     L"Screen is off", L"Screen restored",
     L"Calibrate HDR base brightness", L"Calibration done: base %lu", L"Calibration failed: drag the SDR content brightness slider",
     L"Calibrate wheel icon position", L"Click the lumen icon on the taskbar", L"Wheel position recorded (%d,%d)",
+    L"Per-screen offset", L"Affects All-monitors sync only; direct per-screen control is unaffected",
+    L"Reset all",
 };
 static const wchar_t* tr(int id) { return (g_lang == 2) ? STR_EN[id] : STR_CN[id]; }
 static int RegGet(const wchar_t* name, int def);   // 定义在配置区，ApplyLang 先用
@@ -773,7 +787,9 @@ static std::vector<Mon> Scan() {
             bool ok = GetMonitorBrightness(arr.v[i].hPhysicalMonitor, &mn, &cur, &mx) && mx > mn;
             Mon m;
             m.dev = mi.szDevice;
+            m.gdiDev = mi.szDevice;
             m.key = MonitorKey(mi.szDevice);
+            m.off = std::max(-25, std::min(25, RegGet((L"Off_" + m.key).c_str(), 0)));
             m.name = arr.v[i].szPhysicalMonitorDescription;
             if (m.name.empty()) m.name = mi.szDevice;
             m.controllable = ok;
@@ -794,8 +810,10 @@ static std::vector<Mon> Scan() {
     int wv = g_wmi.Read();
     if (wv >= 0) {
         Mon m;
-        m.dev = L"WMI";
+        m.dev = L"WMI";        // 写入走 WmiSetBrightness，不是 GDI 设备名
+        m.gdiDev.clear();      // 由 RefreshHdrFlags 反查内置面板的真实 GDI 名
         m.key = L"WMI";
+        m.off = std::max(-25, std::min(25, RegGet(L"Off_WMI", 0)));
         m.name = tr(S_BUILTINSCR);
         m.controllable = true;
         m.wmi = true;
@@ -934,31 +952,26 @@ static void RestoreRampsAll() {
 // HDR 软件调光的两段式（10% 临界点，两段在 10% 处亮度连续）：
 //   pct >= 10%：纯 gamma LUT，遮罩 alpha = 0
 //   pct <  10%：gamma 锁死在 10% 的基准值，遮罩 alpha 从 0 线性加深到 0.94（透光 6%）
+// 百分比语义：相对「当前 Windows SDR 白电平」的调光比例——100% = 恒等 LUT（当前最亮）。
+// WlMax / g_baseL 只用于提示行与诊断，不再参与换算，整条 0–100% 都有响应。
 // gamma 在 HDR 下不生效时（部分驱动只对 SDR 叠加层应用 LUT），退化为全区间遮罩。
 static void ComputeDim(int pct, float* scaleOut, int* dimOut) {
     float target = std::max(0, std::min(100, pct)) / 100.f;
-    float baseL = g_baseL.load();
-    if (baseL < 0.05f) baseL = 1.f;
 
     if (g_gammaDead.load()) {             // 全区间遮罩：gamma 不动，遮罩直接按总亮度压
         *scaleOut = 1.f;
         float t = target;
         if (t < 0.06f) t = 0.06f;
         *dimOut = (int)lround((1.f - t) * 100.f);
-        g_clamped.store(false);
         return;
     }
 
     const float kKnee = 0.10f;            // 10% 临界点
-    float gammaL = target / baseL;        // ramp 需要提供的亮度系数
-    float scale = powf(gammaL, 1.f / 2.2f);
-    g_clamped.store(gammaL > 1.f);        // 超过 Windows 基准 → 钳制
-    if (scale > 1.f) scale = 1.f;         // Windows 基准即上限：更亮请调 Windows 滑条
+    float scale = powf(target, 1.f / 2.2f);   // 100% → 1.0，不再按标定基准钳制
 
     int dim = 0;
     if (target < kKnee) {
-        float kneeL = kKnee / baseL;      // 10% 处需要的亮度系数
-        scale = std::min(1.f, powf(kneeL, 1.f / 2.2f));
+        scale = powf(kKnee, 1.f / 2.2f);  // 10% 处锁定的 gamma 系数
         float t = target / kKnee;         // 遮罩透射率：10% → 1，0% → 0
         if (t < 0.06f) t = 0.06f;         // 最深 ≈ 总亮度 6%
         dim = (int)lround((1.f - t) * 100.f);
@@ -1300,6 +1313,10 @@ static void RestoreFromScreenOff();
 
 // 刷新每台屏的 HDR 激活标志；返回是否有变化（供轮询决定是否重绘）
 // 注意：高级色查询必须用路径的 targetInfo（source id 会返回 ERROR_GEN_FAILURE）
+// 内置屏（WMI 通路）的 dev 是伪名 "WMI"，与 DisplayConfig 的 \\.\DISPLAYn 对不上，
+// 过去查不到就一直是 hdr=false / sdrwl=0，徽章与白电平读数全灭、面板退回 SDR 显示。
+// 这里按内置面板路径（embedded / INTERNAL 输出技术）反查它的真实 GDI 名再取状态；
+// 驱动没标内置时再退到「未被 DDC 条目占用的 GDI 名」，最后用任一 HDR 路径兜底。
 static bool RefreshHdrFlags(std::vector<Mon>& mons) {
     UINT32 nPath = 0, nMode = 0;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPath, &nMode) != ERROR_SUCCESS)
@@ -1311,6 +1328,9 @@ static bool RefreshHdrFlags(std::vector<Mon>& mons) {
         return false;
     std::map<std::wstring, bool> hdrOf;
     std::map<std::wstring, ULONG> wlOf;
+    std::wstring internalGdi;              // 内置面板对应的 GDI 设备名
+    bool anyHdr = false;
+    ULONG anyWl = 0;                       // 任一 HDR 路径的白电平（屏被 Scan 丢弃时兜底）
     for (UINT32 i = 0; i < nPath; ++i) {
         DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
         src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
@@ -1347,27 +1367,72 @@ static bool RefreshHdrFlags(std::vector<Mon>& mons) {
         }
         hdrOf[src.viewGdiDeviceName] = hdr;
         wlOf[src.viewGdiDeviceName] = wl;
+        if (hdr) {
+            anyHdr = true;
+            if (!anyWl && wl) anyWl = wl;
+        }
+        // 内置面板：DISPLAYPORT_EMBEDDED(11) / UDI_EMBEDDED(13) / LVDS(6) / INTERNAL(0x80000000)
+        UINT32 tech = (UINT32)paths[i].targetInfo.outputTechnology;
+        bool embedded = (tech == 11 || tech == 13 || tech == 6 || tech == 0x80000000u);
+        if (internalGdi.empty() && embedded)
+            internalGdi = src.viewGdiDeviceName;
     }
+
+    // 驱动没标内置面板时：取没有被任何 DDC 条目占用的 GDI 名作为内置屏
+    if (internalGdi.empty()) {
+        for (auto& kv : hdrOf) {
+            bool used = false;
+            for (auto& m : mons) if (!m.wmi && m.dev == kv.first) { used = true; break; }
+            if (!used) { internalGdi = kv.first; break; }
+        }
+    }
+
     bool changed = false;
     for (auto& m : mons) {
-        auto it = hdrOf.find(m.dev);
-        bool now = (it != hdrOf.end()) && it->second;
+        std::wstring key = m.dev;
+        bool now = false;
+        ULONG wl = 0;
+        if (m.wmi && !internalGdi.empty()) {
+            m.gdiDev = internalGdi;
+            key = internalGdi;              // 用真实 GDI 名取 HDR 状态与白电平
+        } else if (!m.wmi) {
+            m.gdiDev = m.dev;
+        }
+        if (m.wmi && internalGdi.empty()) {
+            now = anyHdr; wl = anyWl;      // 拓扑异常兜底：至少按真实 HDR 状态走，不退回 SDR
+        } else {
+            auto it = hdrOf.find(key);
+            now = (it != hdrOf.end()) && it->second;
+            auto iw = wlOf.find(key);
+            wl = (iw != wlOf.end()) ? iw->second : 0;
+        }
         if (now != m.hdr) { m.hdr = now; changed = true; }
-        auto iw = wlOf.find(m.dev);
-        ULONG wl = (iw != wlOf.end()) ? iw->second : 0;
         if (wl != m.sdrwl) { m.sdrwl = wl; changed = true; }
     }
 
-    // 基准系数：取「HDR 激活」的外接屏；没有（全 SDR / 仅 WCG）→ 1 = 无补偿
+    if (g_hdrAny.load() != anyHdr) { g_hdrAny.store(anyHdr); changed = true; }
+    if (g_hdrAnyWl.load() != anyWl) { g_hdrAnyWl.store(anyWl); changed = true; }
+
+    // 诊断用基准系数（不再参与 ComputeDim 换算）：优先取当前选中屏白电平 ÷ 标定最大值
     float baseL = 1.f;
-    if (g_wlMax >= 1500)
-        for (auto& m : mons)
-            if (m.hdr && m.dev != L"WMI" && m.sdrwl >= 500) {
-                baseL = (float)m.sdrwl / (float)g_wlMax;
-                break;
-            }
+    bool gotBase = false;
+    if (g_wlMax >= 1500) {
+        if (g_sel >= 0 && g_sel < (int)mons.size() && mons[g_sel].hdr && mons[g_sel].sdrwl >= 500) {
+            baseL = (float)mons[g_sel].sdrwl / (float)g_wlMax;
+            gotBase = true;
+        } else {
+            for (auto& m : mons)
+                if (m.hdr && m.sdrwl >= 500) {
+                    baseL = (float)m.sdrwl / (float)g_wlMax;
+                    gotBase = true;
+                    break;
+                }
+        }
+        if (!gotBase && anyHdr && anyWl >= 500)
+            baseL = (float)anyWl / (float)g_wlMax;   // 屏被 DDC 读失败丢掉时用真实白电平
+    }
     if (baseL > 1.f) baseL = 1.f;
-    if (baseL < 0.1f) baseL = 1.f;        // 异常基准 → 放弃补偿
+    if (baseL < 0.1f) baseL = 1.f;        // 异常值 → 退回 1
     g_baseL.store(baseL);
     return changed;
 }
@@ -1434,15 +1499,16 @@ static void RefreshNamesAsync() {
 struct Writer {
     std::mutex m;
     std::condition_variable cv;
-    std::vector<std::wstring> devs;
-    int pct = 0;
+    std::vector<std::pair<std::wstring, int>> jobs;   // (设备, 目标百分比)，各屏可不同（单屏偏移）
     bool has = false, quit = false;
     std::thread th;
+    std::atomic<long long> sickUntil{0};   // DDC 无响应冷却期（GetTickCount64 ms）：HDR 切换等场景
+                                           // DDC 会短暂死亡，阻塞式写入 API 无超时，线程可能永久卡死
 
     void Start() { th = std::thread([this] { Run(); }); }
 
-    void Post(const std::vector<std::wstring>& d, int p) {
-        { std::lock_guard<std::mutex> lk(m); devs = d; pct = p; has = true; }
+    void Post(std::vector<std::pair<std::wstring, int>> dp) {
+        { std::lock_guard<std::mutex> lk(m); jobs = std::move(dp); has = true; }
         cv.notify_one();
     }
 
@@ -1456,20 +1522,39 @@ struct Writer {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         auto last = std::chrono::steady_clock::now() - std::chrono::milliseconds(500);
         for (;;) {
-            std::vector<std::wstring> d;
-            int p = 0;
+            std::vector<std::pair<std::wstring, int>> dp;
             {
                 std::unique_lock<std::mutex> lk(m);
                 cv.wait(lk, [this] { return has || quit; });
                 if (quit) break;
-                d = devs; p = pct; has = false;
+                dp = std::move(jobs);
+                has = false;
             }
             int gapMs = std::max(16, g_cfgDelay);
             auto gap = std::chrono::milliseconds(gapMs) - (std::chrono::steady_clock::now() - last);
             if (gap.count() > 0) std::this_thread::sleep_for(gap);
 
-            bool ok = true;
-            for (auto& dev : d) if (!WriteOne(dev, p, 0)) ok = false;
+            if (GetTickCount64() < sickUntil.load()) continue;   // 冷却期：丢弃硬件写入（状态层已记账）
+
+            // 写入放独立线程 + 4s 看门狗：DDC 卡死时放弃该批（子线程自行了结），
+            // 主循环继续服务后续调节，冷却 8s 后自动重试，避免一条死写拖垮全部亮度功能
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            auto okv = std::make_shared<std::atomic<bool>>(true);
+            std::thread([dp, done, okv]() {
+                bool o = true;
+                for (auto& j : dp) if (!WriteOne(j.first, j.second, 0)) o = false;
+                okv->store(o);
+                done->store(true);
+            }).detach();
+            for (int i = 0; i < 80 && !done->load(); ++i) Sleep(50);
+
+            bool ok;
+            if (done->load()) {
+                ok = okv->load();
+            } else {
+                ok = false;
+                sickUntil.store((long long)GetTickCount64() + 8000);
+            }
             g_fail = !ok;
             last = std::chrono::steady_clock::now();
         }
@@ -1498,7 +1583,7 @@ static void RestoreFromScreenOff() {
             SetMonitorPowerDDC(devs[i], 1);   // 1 = On
             Sleep(350);
             SetMonitorPowerDDC(devs[i], 1);   // 部分固件需二次点亮
-            g_writer.Post({ devs[i] }, saved[i]);
+            g_writer.Post({ { devs[i], saved[i] } });
         }
         CoUninitialize();
         g_restoring = false;
@@ -1509,13 +1594,20 @@ static void Post(int pct) {
     if (g_screenOff) return;   // 熄屏期间禁止写亮度：避免污染 Last_<key> 记忆（恢复走 g_writer.Post 绕过此入口）
     pct = std::max(0, std::min(100, pct));
     g_val = pct;
-    std::vector<std::wstring> devs;
-    if (g_sel >= 0 && g_sel < (int)g_mons.size()) devs.push_back(g_mons[g_sel].dev);
-    else for (auto& m : g_mons) if (m.controllable) devs.push_back(m.dev);
-    g_writer.Post(devs, pct);
-    for (auto& d : devs)
+    std::vector<std::pair<std::wstring, int>> dp;   // 单屏偏移只在「全部显示器」同步时叠加
+    if (g_sel >= 0 && g_sel < (int)g_mons.size()) {
+        dp.push_back({ g_mons[g_sel].dev, pct });
+    } else {
+        for (auto& m : g_mons) if (m.controllable)
+            dp.push_back({ m.dev, std::max(0, std::min(100, pct + m.off)) });
+    }
+    for (auto& j : dp)
         for (auto& m : g_mons)
-            if (m.dev == d) RegPut((L"Last_" + m.key).c_str(), pct);   // 记住每台屏的亮度，唤醒/重启后恢复
+            if (m.dev == j.first) {
+                m.pct = j.second;                                          // 记录实际落到的值（含偏移）
+                RegPut((L"Last_" + m.key).c_str(), j.second);              // 唤醒/重启后按实际值恢复
+            }
+    g_writer.Post(std::move(dp));   // 注意：dp 已被 move，记账必须放在这之前
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -1523,13 +1615,11 @@ static void Adjust(int delta) {
     if (g_mons.empty()) g_mons = Scan();
     if (g_sel >= 0 && g_sel < (int)g_mons.size()) {
         Post(g_mons[g_sel].pct + delta);
-        g_mons[g_sel].pct = g_val;
         return;
     }
     int sum = 0, n = 0;
     for (auto& m : g_mons) if (m.controllable) { sum += m.pct; ++n; }
     Post((n ? sum / n : g_val) + delta);
-    for (auto& m : g_mons) if (m.controllable) m.pct = g_val;
 }
 
 // 唤醒/重启后按 PnPId 恢复每台屏上次的亮度（与注册表记录不同才写）
@@ -1541,12 +1631,12 @@ static void RestoreBrightness() {
         if (g_gammaDim && m.dev != L"WMI") {
             // gamma 状态不跨进程存活：无论 DDC 回读值是否一致，启动都必须重放
             m.pct = last;
-            g_writer.Post({ m.dev }, last);
+            g_writer.Post({ { m.dev, last } });
             continue;
         }
         if (last == m.pct) continue;
         m.pct = last;
-        g_writer.Post({ m.dev }, last);
+        g_writer.Post({ { m.dev, last } });
     }
     int sum = 0, n = 0;
     for (auto& m : g_mons) if (m.controllable) { sum += m.pct; ++n; }
@@ -1567,9 +1657,14 @@ static void CopyDiagnostics() {
              HotkeyText(g_hkDownMod, g_hkDownVk).c_str(),
              HotkeyText(g_hkShowMod, g_hkShowVk).c_str());
     t += b;
+    swprintf(b, 320, L"\r\nhdrAny=%d hdrAnyWl=%lu baseL=%.3f gammaDead=%d wlMax=%d",
+             g_hdrAny.load() ? 1 : 0, g_hdrAnyWl.load(), g_baseL.load(),
+             g_gammaDead.load() ? 1 : 0, g_wlMax);
+    t += b;
     for (auto& m : g_mons) {
-        swprintf(b, 320, L"\r\nmonitor: %ls | key=%ls | dev=%ls | ctrl=%d pct=%d",
-                 m.name.c_str(), m.key.c_str(), m.dev.c_str(), m.controllable ? 1 : 0, m.pct);
+        swprintf(b, 320, L"\r\nmonitor: %ls | key=%ls | dev=%ls | gdi=%ls | ctrl=%d pct=%d hdr=%d wl=%lu",
+                 m.name.c_str(), m.key.c_str(), m.dev.c_str(), m.gdiDev.c_str(),
+                 m.controllable ? 1 : 0, m.pct, m.hdr ? 1 : 0, m.sdrwl);
         t += b;
     }
     if (!OpenClipboard(g_msg)) return;
@@ -1713,10 +1808,12 @@ static void DrawTracked(Graphics& g, const wchar_t* s, Font& f, Brush& b,
 // ---------------------------------------------------------------- 主面板
 
 static void DrawSettingsPage(Graphics& g, int W, int H);
+static void DrawCalibPage(Graphics& g, int W, int H);
 static void DrawMonitorMenu(Graphics& g, int W, int H);
 
 static void DrawPanel(Graphics& g, int W, int H) {
     if (g_page == 1) { DrawSettingsPage(g, W, H); return; }
+    if (g_page == 2) { DrawCalibPage(g, W, H); return; }
     LinearGradientBrush bg(PointF(0, 0), PointF((float)W, (float)H), g_pal.bg1, g_pal.bg2);
     // 窗口 RGN 圆角与卡片抗锯齿圆角曲线不重合，先整体铺底色，避免四角露出未绘制的黑底
     g.FillRectangle(&bg, -2.f, -2.f, (float)W + 4, (float)H + 4);
@@ -1777,7 +1874,11 @@ static void DrawPanel(Graphics& g, int W, int H) {
     // 进度弧槽（内阴影感） + 亮度进度弧（HDR 激活时切换专属高亮发光样式）
     bool hdrNow = false;
     if (g_sel >= 0 && g_sel < (int)g_mons.size()) hdrNow = g_mons[g_sel].hdr;
-    else for (auto& mm : g_mons) if (mm.hdr) hdrNow = true;
+    else {
+        // 「全部显示器」按真实活动路径判定：HDR 切换瞬间某屏 DDC 读失败被 Scan 丢掉也不误判为 SDR
+        hdrNow = g_hdrAny.load();
+        for (auto& mm : g_mons) if (mm.hdr) hdrNow = true;
+    }
 
     float trk = TRACK_R, tw = 13.f;
     RectF arc(KNOB_CX - trk, KNOB_CY - trk, trk * 2, trk * 2);
@@ -1948,9 +2049,13 @@ static void DrawPanel(Graphics& g, int W, int H) {
         wchar_t hb2[96];
         ULONG wl = 0;
         if (g_sel >= 0 && g_sel < (int)g_mons.size()) wl = g_mons[g_sel].sdrwl;
-        else for (auto& mm : g_mons) if (mm.hdr && mm.sdrwl) { wl = mm.sdrwl; break; }
-        if (g_clamped.load())
-            swprintf(hb2, 96, L"已到 Windows 基准上限：调高「SDR 内容亮度」滑条可更亮");
+        else {
+            for (auto& mm : g_mons) if (mm.hdr && mm.sdrwl) { wl = mm.sdrwl; break; }
+            if (!wl) wl = g_hdrAnyWl.load();   // 屏被丢弃时仍显示真实白电平，不再显示 0
+        }
+        // 标定值只作参考刻度：显示「当前白电平 / 标定最大白电平」，不再参与亮度换算
+        if (g_wlMax >= 1500)
+            swprintf(hb2, 96, L"Windows 白电平 %lu/%d · lumen 调光 %d%%", wl, g_wlMax, g_val);
         else
             swprintf(hb2, 96, L"Windows 白电平 %lu · lumen 调光 %d%%", wl, g_val);
         g.DrawString(hb2, -1, &fh, RectF(0, HINT_Y, (float)W, 16), &sf, &hb);
@@ -2376,6 +2481,74 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
     g.DrawString(msg, -1, &fs, PointF(SET_L, H - 40.f), msgBrush);
 }
 
+// ---- 校准页（单屏偏移）：行距同设置页，右对齐到 364；只影响「全部显示器」同步
+static float CalRowY(int i)       { return 128.f + i * 52.f; }
+static RectF  CalMinusRect(int i) { return RectF(236.f, CalRowY(i) - 4.f, 30.f, 30.f); }
+static RectF  CalPlusRect(int i)  { return RectF(334.f, CalRowY(i) - 4.f, 30.f, 30.f); }
+static RectF  CalResetRect()      { return RectF(SET_L, CalRowY((int)g_mons.size()) + 2.f, 130.f, 30.f); }
+
+static void DrawCalibPage(Graphics& g, int W, int H) {
+    // 与设置页完全同源的卡片：同一渐变、同一 34 px 圆角、同一描边
+    LinearGradientBrush bg(PointF(0, 0), PointF(0, (float)H), g_pal.bg1, g_pal.bg2);
+    g.FillRectangle(&bg, -2.f, -2.f, (float)W + 4, (float)H + 4);   // 铺底防黑角
+    GraphicsPath card;
+    RoundRect(card, RectF(0, 0, (float)W, (float)H), 34.f);
+    g.FillPath(&bg, &card);
+    Pen border(g_pal.pillEdge, 1.f);
+    g.DrawPath(&border, &card);
+
+    SolidBrush tb(g_pal.text);
+    SolidBrush sb(g_pal.sub);
+    SolidBrush acc(g_dark ? g_pal.prog : g_pal.progDot);
+    Font fb(L"Microsoft YaHei UI", 14, FontStyleRegular, UnitPixel);
+    Font ft(L"Microsoft YaHei UI", 22, FontStyleBold, UnitPixel);
+    Font fs(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
+    Font fv(L"Microsoft YaHei UI", 15, FontStyleBold, UnitPixel);
+
+    StringFormat cen;
+    cen.SetAlignment(StringAlignmentCenter);
+    cen.SetLineAlignment(StringAlignmentCenter);
+    StringFormat lft;
+    lft.SetLineAlignment(StringAlignmentCenter);
+    lft.SetFormatFlags(StringFormatFlagsNoWrap);
+    lft.SetTrimming(StringTrimmingEllipsisCharacter);
+    StringFormat rgt;
+    rgt.SetAlignment(StringAlignmentFar);
+    rgt.SetLineAlignment(StringAlignmentCenter);
+
+    g.DrawString(tr(S_BACK), -1, &fs, PointF(28, 18), &sb);
+    g.DrawString(tr(S_OFFPG), -1, &ft, RectF(0, 46, (float)W, 32), &cen, &tb);
+    g.DrawString(tr(S_OFFHINT), -1, &fs, RectF(0, 80, (float)W, 16), &cen, &sb);
+
+    Pen sep(g_pal.pillEdge, 1.f);
+    g.DrawLine(&sep, SET_L, 102.f, SET_R, 102.f);
+
+    for (int i = 0; i < (int)g_mons.size(); ++i) {
+        float y = CalRowY(i);
+        std::wstring name = g_mons[i].name;
+        if (name.size() > 14) name = name.substr(0, 13) + L"…";
+        RectF nr(SET_L, y - 4.f, 192.f, 30.f);
+        g.DrawString(name.c_str(), -1, &fb, nr, &lft, &tb);
+
+        MiniButton(g, CalMinusRect(i).X, CalMinusRect(i).Y, false);
+        MiniButton(g, CalPlusRect(i).X, CalPlusRect(i).Y, true);
+
+        wchar_t vb[12];
+        int off = g_mons[i].off;
+        if (off > 0) swprintf(vb, 12, L"+%d", off);
+        else swprintf(vb, 12, L"%d", off);
+        SolidBrush& vbr = off ? acc : sb;
+        g.DrawString(vb, -1, &fv, RectF(274.f, y - 4.f, 50.f, 30.f), &rgt, &vbr);
+    }
+
+    GraphicsPath rp;
+    RoundRect(rp, CalResetRect(), 15.f);
+    SolidBrush rb(g_pal.pill);
+    g.FillPath(&rb, &rp);
+    g.DrawPath(&border, &rp);
+    g.DrawString(tr(S_OFFRESET), -1, &fs, CalResetRect(), &cen, &tb);
+}
+
 // ---------------------------------------------------------------- 面板窗口过程
 
 static void HidePanel() {
@@ -2431,8 +2604,10 @@ static const float MENU_PAD = 12.f;
 
 static int MenuCount() { return 1 + (int)g_mons.size(); }
 
+#define MENU_HIT_CALIB 900   // 菜单页脚「单屏偏移…」行
+
 static RectF MenuBox(int H) {
-    float h = MENU_PAD * 2 + MenuCount() * MENU_ITEM_H;
+    float h = MENU_PAD * 2 + (MenuCount() + 1) * MENU_ITEM_H;   // 末行：单屏偏移入口
     float bottom = H - 16.f;
     float top = bottom - h;
     if (top < 250.f) top = 250.f;          // 显示器很多时不再往上顶
@@ -2445,7 +2620,7 @@ static RectF MenuItemRect(int i, int H) {
                  box.Width - 16.f, MENU_ITEM_H);
 }
 
-// 返回 -1 表示点在菜单外，0 = 全部显示器，1..n = 第 n 台
+// 返回 -1 表示点在菜单外，0 = 全部显示器，1..n = 第 n 台，MENU_HIT_CALIB = 偏移校准入口
 static int MenuHit(int x, int y, int H) {
     if (!g_menuOpen) return -1;
     if (!InRect(MenuBox(H), x, y)) return -1;
@@ -2453,6 +2628,8 @@ static int MenuHit(int x, int y, int H) {
         RectF r = MenuItemRect(i, H);
         if (x >= r.X && x <= r.X + r.Width && y >= r.Y && y <= r.Y + r.Height) return i;
     }
+    RectF f = MenuItemRect(MenuCount(), H);
+    if (x >= f.X && x <= f.X + f.Width && y >= f.Y && y <= f.Y + f.Height) return MENU_HIT_CALIB;
     return -1;
 }
 
@@ -2547,6 +2724,26 @@ static void DrawMonitorMenu(Graphics& g, int W, int H) {
         g.DrawString(label.c_str(), -1, sel ? &fb : &fi,
                      RectF(r.X + 32, r.Y, r.Width - 40, r.Height), &lf, sel ? &tb : &sb);
     }
+
+    // 页脚：单屏偏移校准入口（多屏观感不一致时逐屏补偿）
+    RectF fr = MenuItemRect(MenuCount(), H);
+    if (g_menuHover == MENU_HIT_CALIB) {
+        GraphicsPath hp;
+        RoundRect(hp, fr, 11.f);
+        SolidBrush hb(g_pal.menuHover);
+        g.FillPath(&hb, &hp);
+    }
+    Pen sepf(g_pal.pillEdge, 1.f);
+    g.DrawLine(&sepf, fr.X + 14, fr.Y + 1, fr.X + fr.Width - 14, fr.Y + 1);
+    g.DrawString(tr(S_OFFPG), -1, &fi,
+                 RectF(fr.X + 32, fr.Y, fr.Width - 44, fr.Height), &lf, &sb);
+    // 右侧箭头
+    float ax = fr.X + fr.Width - 26, ay = fr.Y + fr.Height / 2;
+    Pen ap(g_pal.sub, 1.8f);
+    ap.SetStartCap(LineCapRound);
+    ap.SetEndCap(LineCapRound);
+    g.DrawLine(&ap, ax - 3, ay - 4, ax + 2, ay);
+    g.DrawLine(&ap, ax + 2, ay, ax - 3, ay + 4);
 }
 
 static int HitButton(int x, int y) {
@@ -2618,7 +2815,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TrackMouseEvent(&tme);
         float s = g_dpi / 96.0f * UI_SCALE;
         int x = (int)(GET_X_LPARAM(lp) / s), y = (int)(GET_Y_LPARAM(lp) / s);
-        if (g_page == 1) return 0;
+        if (g_page >= 1) return 0;           // 设置页/校准页不响应 hover 与轨道交互
         if (g_menuOpen) {
             int hv = MenuHit(x, y, PANEL_H);
             if (hv != g_menuHover) { g_menuHover = hv; InvalidateRect(hwnd, nullptr, FALSE); }
@@ -2641,8 +2838,41 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int hit = MenuHit(x, y, PANEL_H);
             g_menuOpen = false;
             g_menuHover = -1;
+            if (hit == MENU_HIT_CALIB) {
+                g_page = 2;                  // 进入单屏偏移校准页
+                PlacePanel();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (hit >= 0) ApplyMonitorSel(hit - 1);
             InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        if (g_page == 2) {
+            SetFocus(hwnd);
+            if (InRect(SetBackRect(), x, y)) {
+                g_page = 0;
+                PlacePanel();                // 回主面板
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            for (int i = 0; i < (int)g_mons.size(); ++i) {
+                bool minus = InRect(CalMinusRect(i), x, y);
+                bool plus  = InRect(CalPlusRect(i), x, y);
+                if (!minus && !plus) continue;
+                g_mons[i].off = std::max(-25, std::min(25, g_mons[i].off + (plus ? 1 : -1)));
+                RegPut((L"Off_" + g_mons[i].key).c_str(), g_mons[i].off);
+                if (g_sel == -1) Post(g_val);   // 「全部显示器」下立即按新偏移重写，所见即所得
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (InRect(CalResetRect(), x, y)) {
+                for (auto& m : g_mons) { m.off = 0; RegPut((L"Off_" + m.key).c_str(), 0); }
+                if (g_sel == -1) Post(g_val);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             return 0;
         }
 
@@ -2757,7 +2987,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_MOUSEWHEEL: {
-        if (g_page == 1 || g_capSlot || g_menuOpen || !g_wheelPanel) return 0;
+        if (g_page >= 1 || g_capSlot || g_menuOpen || !g_wheelPanel) return 0;
         int d = GET_WHEEL_DELTA_WPARAM(wp);
         int steps = (d / WHEEL_DELTA) * g_step;
         if (!steps) steps = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）
@@ -2792,8 +3022,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_menuOpen = false;
                 g_menuHover = -1;
                 InvalidateRect(hwnd, nullptr, FALSE);
-            } else if (g_page == 1) {
-                g_page = 0;
+            } else if (g_page >= 1) {
+                g_page = 0;                  // 设置页/校准页：Esc 回主面板
                 PlacePanel();
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else {
@@ -2825,7 +3055,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_NCHITTEST: {
         POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &p);
-        if (g_page == 1 && p.x < (int)(Scale(140) * UI_SCALE) &&
+        if (g_page >= 1 && p.x < (int)(Scale(140) * UI_SCALE) &&
             p.y < (int)(Scale(60) * UI_SCALE)) return HTCLIENT;
         if (p.y < (int)(Scale(52) * UI_SCALE)) return HTCAPTION;
         return HTCLIENT;
@@ -3323,7 +3553,7 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RegPut(L"WlMax", g_wlMax);
             RefreshHdrFlags(g_mons);
             swprintf(info, 128, tr(S_CALDONE), mx);
-            Post(g_val);                      // 用新基准立即重放当前亮度
+            Post(g_val);                      // 标定只刷新提示/诊断刻度，重放一次保持状态同步
         } else {
             swprintf(info, 128, tr(S_CALFAIL));
         }
