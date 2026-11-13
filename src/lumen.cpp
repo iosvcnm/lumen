@@ -48,7 +48,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_DIM     (WM_APP + 8)   // wParam = dev string (heap), lParam = 遮罩黑度 0-85
 #define WM_WLCAL   (WM_APP + 9)   // wParam = 标定得到的滑条最大白电平（0 = 失败）
 
-#define APP_VERSION L"1.3.2"
+#define APP_VERSION L"1.4.0"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
@@ -79,6 +79,9 @@ static HINSTANCE g_inst = nullptr;
 static HWND      g_msg = nullptr;
 static HWND      g_hwnd = nullptr;
 static HWND      g_osd = nullptr;
+static POINT g_osdPos = { -1, -1 };   // 记忆的 OSD 位置（屏幕坐标）；负值 = 未拖过，默认右上
+static bool  g_osdDrag = false;       // OSD 拖动中：暂停自动隐藏，ShowOsdNow 不重定位
+static POINT g_osdAnchor{};           // 拖动锚点（客户区坐标）
 static bool      g_tray = false;
 static NOTIFYICONDATAW g_nid{};
 static int       g_dpi = 96;
@@ -111,20 +114,31 @@ static bool g_dark = false;
 static std::atomic<bool> g_fail{false};
 
 static int  g_cfgAuto = 0, g_cfgDelay = 25, g_cfgTheme = 0, g_cfgStart = 0;
+// 自动亮度打开时的缓升过渡：从当前亮度 5 秒滑到目标（200ms 一 tick，25 步），手动调节立即取消
+static bool g_autoRamp = false;       // 过渡进行中（timer 7，200ms 一 tick）
+static bool g_autoEngaged = false;    // 自动亮度处于生效状态（0→1 的那一次 Apply 才启动过渡）
+static bool g_rampPost = false;       // RampPost 标记：区分过渡自身写入与用户手动调节
+static int  g_autoFrom = 0, g_autoTo = 0, g_autoTick = 0;
+static const int AUTO_RAMP_TICKS = 25;
+static const UINT AUTO_RAMP_TIMER_MS = 200;
+static void AutoRampStop() {          // 取消过渡（手动调节 / 开关关闭 / 熄屏时）
+    if (g_autoRamp) {
+        g_autoRamp = false;
+        if (g_msg) KillTimer(g_msg, 7);
+    }
+}
 static int  g_cfgStartH = 7, g_cfgEndH = 19;
 static int  g_dayPct = 80, g_nightPct = 20;   // 到点后的目标亮度：日间 / 夜间
 static int  g_page = 0;   // 0 主面板 1 设置页
+static int  g_subScroll = 0;   // 子页（设置/校准）内容滚动偏移：逻辑 px，向下为正；页高固定 570，内容超出时滚动
 static bool g_wantSettings = false;   // 首次建窗时直接进设置页
+static int  g_setFold = 0;            // 设置页分组折叠位：bit0 通用 / bit1 快捷键 / bit2 鼠标与键盘 / bit3 关于（1=展开）
+static int  g_setHeaderHover = -1;    // 设置页悬停的分组标题（-1 无）
 
-// 设置页比主面板高（容纳「鼠标设置」分组）；建窗与 PlacePanel 按当前页取高，底部锚点不变
-static const int SET_PAGE_H = 750;   // 容纳鼠标与键盘分组的三行开关
-// 校准页（单屏偏移）高度：标题区 + 每屏一行 + 归零行；最少 400，避免大面积留白
-static int CalibPageH() {
-    int h = 182 + (int)g_mons.size() * 52;
-    return std::max(400, h);
-}
+// 所有子页（设置/校准）固定与主面板同高（570）；内容超出时页内滚动（SubScrollMax/g_subScroll）
+static int SettingsPageH();   // 定义在设置页几何段：展开分组的**内容总高**
 static int PageH() {
-    return g_page == 1 ? SET_PAGE_H : (g_page == 2 ? CalibPageH() : PANEL_H);
+    return PANEL_H;   // 所有页固定与主面板同高；内容超出时页内滚动（g_subScroll）
 }
 static UINT g_hkUpMod = MOD_CONTROL, g_hkUpVk = VK_PRIOR;
 static UINT g_hkDownMod = MOD_CONTROL, g_hkDownVk = VK_NEXT;
@@ -134,8 +148,24 @@ static int  g_hover = -1;          // 0 胶囊，1..4 快捷按钮
 static bool g_screenOff = false;                // 熄屏状态：true = 已对选中屏幕发送关闭指令
 static DWORD g_offAt = 0;                       // 熄屏时刻，3 秒宽限期内忽略输入，防止误触把屏幕点回来
 static DWORD g_offInputBase = 0;                // 熄屏那一刻的「最后输入时间」，之后只有变化才算新输入
-static bool g_moved = false;                    // 用户拖动过面板：切页时保持位置，不再回到右下角
-static POINT g_movedPos{};                      // 拖动后的窗口左上角（屏幕坐标）
+static bool g_moved = false;                    // 用户拖动过面板：切页与跨开关都保持位置（注册表 PanelX/PanelY）
+static POINT g_movedPos{};                      // 拖动后的窗口左上角（屏幕坐标），负值 = 未拖过
+// —— 子页双层缓存（滚动/重绘优化）：chrome=卡片+页眉，content=各行控件 ——
+// 滚动只是 content 位图的源偏移搬运；chrome 在主题/语言/尺寸变化时重建，content 在内容变化时重建。
+// 呈现目标直接是 ULW 的 PARGB DIB（尺寸变化才重建），省掉每帧位图分配与整幅 memcpy。常驻内存 +约 2MB。
+static Bitmap* g_chromeBmp = nullptr;
+static int     g_chromeW = 0, g_chromeH = 0, g_chromePage = -1;
+static Bitmap* g_cntBmp = nullptr;
+static int     g_cntW = 0, g_cntH = 0, g_cntPage = -1;
+static bool    g_pageCacheDirty = true;
+static Bitmap* g_presBmp = nullptr;      // 包装 ULW DIB 的 GDI+ 画布
+static HDC     g_presDC = nullptr;
+static HBITMAP g_presDIB = nullptr;
+static int     g_presW = 0, g_presH = 0;
+static bool    g_scrollAnim = false;     // 滚轮缓动进行中（timer 8 @16ms）
+static int     g_scrollTo = 0;
+static bool    g_scrollDrag = false;     // 滚动条拖动中（点按/拖动 thumb 直接跳转）
+static void TouchPageCache() { g_pageCacheDirty = true; }
 static std::vector<std::wstring> g_offDevs;     // 已熄屏的外接 DDC 设备（\\.\DISPLAYn）
 static std::vector<int> g_offSaved;             // 与 g_offDevs 对应的熄屏前亮度快照（百分比）
 static bool g_offAll = false;                   // 是否同时广播 SC_MONITORPOWER（内置屏 / 「全部显示器」兜底）
@@ -155,8 +185,14 @@ static int Scale(int v) { return MulDiv(v, g_dpi, 96); }
 // 面板整体缩到 86%，逻辑坐标仍按 400x570 绘制
 static const float UI_SCALE = 0.86f;
 
+// 用户字体缩放（设置页「字体大小」90–120%）：所有 GDI+ 字号经 FS() 放大，行高不变（余量足够）
+static int   g_fontPct = 100;
+static float g_fontScale = 1.0f;
+static float FS(float px) { return px * g_fontScale; }
+
 // ---------------------------------------------------------------- 多语言（0 跟随系统 / 1 中文 / 2 English）
 static int g_lang = 0;
+static int g_langPref = 0;   // 注册表原始偏好（0 未解析），g_lang 是 ApplyLang 解析后的实际语言
 static int g_step = 5;       // 滚轮/热键步长，可调 1/2/5/10
 static int g_wheelTray = 1, g_wheelPanel = 1;   // 鼠标设置：托盘图标 / 打开面板时滚轮调节亮度
 static int g_keyBright = 0;                     // 键盘 HID 亮度键（Consumer 0x6F/0x70），默认关
@@ -183,6 +219,8 @@ enum {
     S_RESTOFF, S_RESTON,
     S_CAL, S_CALDONE, S_CALFAIL, S_CALIB, S_CALIBHINT, S_CALDONE2,
     S_OFFPG, S_OFFHINT, S_OFFRESET,
+    S_GENERAL, S_ABOUT, S_HOME, S_HOOKFAIL,
+    S_FOLL, S_FONTS,
     S_COUNT
 };
 static const wchar_t* const STR_CN[S_COUNT] = {
@@ -204,13 +242,15 @@ static const wchar_t* const STR_CN[S_COUNT] = {
     L"标定 HDR 基准亮度", L"标定完成：基准 %lu", L"标定失败：请先拖动「SDR 内容亮度」滑条",
     L"校准滚轮图标位置", L"请点击任务栏上的 lumen 图标", L"已记录滚轮位置 (%d,%d)",
     L"单屏偏移", L"只影响「全部显示器」同步；单屏直接调节不偏移", L"全部归零",
+    L"通用", L"关于", L"项目主页", L"键盘钩子安装失败：点击面板后仍可录入",
+    L"跟随系统", L"字体大小",
 };
 static const wchar_t* const STR_EN[S_COUNT] = {
     L"Brightness", L"Theme", L"Auto", L"Light", L"Dark",
     L"All monitors", L"No controllable monitor", L"All monitors (%d)", L" (built-in)", L" (primary)", L" (secondary)", L" · fixed",
     L"Builtin display", L"Generic monitor %d",
     L"Click to switch monitor", L"Write failed: check DDC/CI", L"←  Back", L"Settings", L"Start with Windows", L"Time-based auto",
-    L"Start time", L"End time", L"DDC delay", L"Step",
+    L"Start", L"End", L"DDC delay", L"Step",
     L"Global hotkeys", L"Up", L"Down", L"Show", L"Press Ctrl or Alt + key…", L"Combo occupied by another app, keeping the old one",
     L"Needs Ctrl or Alt, e.g. Ctrl+Alt+Up", L"Edit", L"Cancel",
     L"lumen · DDC/CI + WMI hybrid control",
@@ -218,19 +258,23 @@ static const wchar_t* const STR_EN[S_COUNT] = {
     L"Software dimming (for HDR monitors)",
     L"%ls %ls: combo occupied", L"lumen %ls is available\nhttps://github.com/iosvcnm/lumen/releases/latest",
     L" · HDR",
-    L"Day brightness", L"Night brightness",
+    L"Day", L"Night",
     L"Mouse & keyboard", L"Wheel on tray icon adjusts brightness", L"Wheel in panel adjusts brightness",
     L"Keyboard brightness keys",
     L"Screen is off", L"Screen restored",
     L"Calibrate HDR base brightness", L"Calibration done: base %lu", L"Calibration failed: drag the SDR content brightness slider",
     L"Calibrate wheel icon position", L"Click the lumen icon on the taskbar", L"Wheel position recorded (%d,%d)",
-    L"Per-screen offset", L"Affects All-monitors sync only; direct per-screen control is unaffected",
+    L"Per-screen offset", L"Sync offset applies to All-monitors only",
     L"Reset all",
+    L"General", L"About", L"Project page", L"Keyboard hook failed: click the panel first to record",
+    L"Follow system", L"Font size",
 };
 static const wchar_t* tr(int id) { return (g_lang == 2) ? STR_EN[id] : STR_CN[id]; }
 static int RegGet(const wchar_t* name, int def);   // 定义在配置区，ApplyLang 先用
 static void ApplyLang() {
+    TouchPageCache();                        // 子页文字全部随语言变化，内容缓存作废
     int v = RegGet(L"Lang", 0);
+    g_langPref = v;                          // 设置页显示用原始偏好（0=跟随系统）
     if (v == 0) {
         WORD u = GetUserDefaultUILanguage();
         g_lang = (u >= 0x0800 && (u & 0xFF00) == 0x0800 && PRIMARYLANGID(u) == LANG_CHINESE) ? 1 : 2;
@@ -305,11 +349,22 @@ static void LoadConfig() {
     g_wheelTray  = RegGet(L"WheelTray", 1) ? 1 : 0;
     g_wheelPanel = RegGet(L"WheelPanel", 1) ? 1 : 0;
     g_keyBright  = RegGet(L"KeyBright", 0) ? 1 : 0;
+    g_setFold = RegGet(L"SetFold", 0) & 0xF;   // 分组折叠状态（bit0 通用 / bit1 快捷键 / bit2 鼠标 / bit3 关于）
     g_wlMax = RegGet(L"WlMax", 0);
     { int tx = RegGet(L"TrayX", -1), ty = RegGet(L"TrayY", -1);
       if (tx >= 0 && ty >= 0) { g_iconPt = POINT{tx, ty}; g_iconHover = true; } }
+    g_osdPos.x = (int)RegGet(L"OsdX", (DWORD)-1);   // 屏幕坐标可为负（副屏在主屏左侧），-1 = 未拖过
+    g_osdPos.y = (int)RegGet(L"OsdY", (DWORD)-1);
+    if (g_osdPos.x < 0 || g_osdPos.y < 0) { g_osdPos.x = -1; g_osdPos.y = -1; }
+    g_movedPos.x = (int)RegGet(L"PanelX", (DWORD)-1);   // 面板记忆位置：拖动结束持久化，打开时越出工作区则收回
+    g_movedPos.y = (int)RegGet(L"PanelY", (DWORD)-1);
+    if (g_movedPos.x < 0 || g_movedPos.y < 0) { g_movedPos.x = -1; g_movedPos.y = -1; }
+    g_moved = (g_movedPos.x >= 0 && g_movedPos.y >= 0);
     int st = RegGet(L"Step", 5);
     g_step = (st == 1 || st == 2 || st == 5 || st == 10) ? st : 5;
+    g_fontPct = RegGet(L"FontPct", 100);
+    if (g_fontPct < 90 || g_fontPct > 110 || g_fontPct % 10) g_fontPct = 100;   // 90–110%，120% 会标签压数值
+    g_fontScale = g_fontPct / 100.0f;
     ApplyLang();
 }
 
@@ -336,6 +391,7 @@ static std::wstring ModName(UINT m) {
 static std::wstring HotkeyText(UINT mod, UINT vk) { return ModName(mod) + KeyName(vk); }
 
 static void ApplyHotkey(int slot, UINT mod, UINT vk) {
+    TouchPageCache();                        // 快捷键 pill 文本变化
     if (!g_msg) return;
     UINT* pMod = (slot == 1) ? &g_hkUpMod : (slot == 2) ? &g_hkDownMod : &g_hkShowMod;
     UINT* pVk  = (slot == 1) ? &g_hkUpVk  : (slot == 2) ? &g_hkDownVk  : &g_hkShowVk;
@@ -384,6 +440,7 @@ static void NotifyHotkeyFailures() {
 // 热键录制：低级键盘钩子只观察不吞键，焦点不在本程序时也能捕获；
 // 面板自身的 WM_KEYDOWN 作为第二条路径，钩子已处理时 g_capSlot 已清零，不会重复生效。
 static HHOOK g_kbHook = nullptr;
+static bool  g_hookDead = false;   // 最近一次录制钩子安装失败（兜底：面板聚焦时仍可录入）
 static UINT  g_hookMod = 0;
 static int   g_pendSlot = 0;
 static UINT  g_pendMod = 0, g_pendVk = 0;
@@ -403,6 +460,7 @@ static bool HotkeyValid(UINT mod, UINT vk) {
 }
 
 static void StopCapture() {
+    TouchPageCache();                        // 录制 pill 文本变化
     g_capSlot = 0;
     if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -450,10 +508,16 @@ static LRESULT CALLBACK LowLevelKey(int code, WPARAM wp, LPARAM lp) {
 }
 
 static void StartCapture(int slot) {
+    TouchPageCache();
     g_capSlot = slot;
     g_hkMsg = 0;
     g_hookMod = 0;
-    if (!g_kbHook) g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKey, g_inst, 0);
+    // 无条件重装钩子：LL 钩子被系统静默摘除后（回调超时的经典行为，UI 线程忙时发生），
+    // 旧句柄还在、回调却永不再触发，"if (!g_kbHook)" 会一直复用死钩子——
+    // 表现为录制只剩面板 WM_KEYDOWN 兜底路径，Alt 组合（WM_SYSKEYDOWN）录不进。
+    if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKey, g_inst, 0);
+    g_hookDead = (g_kbHook == nullptr);
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -478,6 +542,7 @@ static void ApplyAutostart(bool on) {
 // ---------------------------------------------------------------- 主题
 
 static void LoadTheme() {
+    TouchPageCache();                        // 调色板整体变化
     int mode = g_cfgTheme;
     if (mode == 0) {
         DWORD v = 1, n = sizeof(v), t = 0;
@@ -1113,6 +1178,8 @@ static void OverlayPrune() {   // 拓扑变化后：裁掉已消失的屏、重�
     }
 }
 
+static std::atomic<long long> g_verifyDeadUntil{0};   // 假成功设备冷却：读回不符且重试仍失败后 5s 内不再重试
+
 static bool WriteOne(const std::wstring& dev, int pct, unsigned delayMs) {
     if (g_gammaDim && dev != L"WMI") {          // 软件调光：gamma + 遮罩替代 DDC（HDR 固件锁亮度时用）
         float scale = 1.f;
@@ -1154,7 +1221,33 @@ static bool WriteOne(const std::wstring& dev, int pct, unsigned delayMs) {
             DWORD mn = 0, cur = 0, mx = 0;
             if (!GetMonitorBrightness(v[i].hPhysicalMonitor, &mn, &cur, &mx) || mx <= mn) continue;
             DWORD raw = mn + (DWORD)((pct * (mx - mn) + 50) / 100);
-            if (SetMonitorBrightness(v[i].hPhysicalMonitor, raw)) any = true;
+            // 读回校验：部分显示器（Redmi 238NFS 等）切到非标准显示模式后，固件静默丢弃
+            // DDC/CI 写入但 API 仍返回成功（假成功）——旧逻辑此时返回 true，面板永远不提示。
+            // 写入后读回比对（±1 容忍舍入），不符且设备未进冷却则重试一次；仍不符视为失败，
+            // 让面板红字（S_FAIL）出现，用户可自查显示模式 / DDC/CI 开关。
+            bool done = SetMonitorBrightness(v[i].hPhysicalMonitor, raw) != FALSE;
+            if (done) {
+                DWORD back = 0;
+                if (GetMonitorBrightness(v[i].hPhysicalMonitor, &mn, &back, &mx)) {
+                    long d = (long)back - (long)raw;
+                    if (d < -1 || d > 1) {
+                        bool retry = g_verifyDeadUntil.load() <= (long long)GetTickCount64();
+                        if (retry) {
+                            Sleep(50);
+                            done = SetMonitorBrightness(v[i].hPhysicalMonitor, raw) != FALSE;
+                            DWORD rb = 0;
+                            if (done && GetMonitorBrightness(v[i].hPhysicalMonitor, &mn, &rb, &mx)) {
+                                d = (long)rb - (long)raw;
+                                if (d < -1 || d > 1) done = false;
+                            }
+                            if (!done) g_verifyDeadUntil.store((long long)GetTickCount64() + 5000);
+                        } else {
+                            done = false;   // 冷却期内：不再花重试开销，直接判失败
+                        }
+                    }
+                }
+            }
+            if (done) any = true;
         }
         DestroyPhysicalMonitors(cnt, v.data());
         if (delayMs) Sleep(delayMs);
@@ -1451,6 +1544,7 @@ struct NameCache {
 static NameCache g_nm;
 
 static void ApplyNames(std::vector<Mon>& mons) {
+    TouchPageCache();                        // 校准页显示器名称异步到达
     std::map<std::wstring, std::wstring> cache;
     {
         std::lock_guard<std::mutex> lk(g_nm.m);
@@ -1596,6 +1690,7 @@ static void RestoreFromScreenOff() {
 
 static void Post(int pct) {
     if (g_screenOff) return;   // 熄屏期间禁止写亮度：避免污染 Last_<key> 记忆（恢复走 g_writer.Post 绕过此入口）
+    if (g_autoRamp && !g_rampPost) AutoRampStop();   // 过渡期间用户手动调节：立即取消过渡，尊重手动值
     pct = std::max(0, std::min(100, pct));
     g_val = pct;
     std::vector<std::pair<std::wstring, int>> dp;   // 单屏偏移只在「全部显示器」同步时叠加
@@ -1652,9 +1747,9 @@ static void CopyDiagnostics() {
     if (g_mons.empty()) g_mons = Scan();
     std::wstring t = std::wstring(L"lumen ") + APP_VERSION;
     wchar_t b[320];
-    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d gamma=%d wheel=%d/%d key=%d",
+    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d gamma=%d wheel=%d/%d key=%d hookFail=%d",
              g_lang, g_cfgTheme, g_step, g_cfgDelay, g_cfgAuto, g_cfgStartH, g_cfgEndH,
-             g_cfgStart, g_gammaDim, g_wheelTray, g_wheelPanel, g_keyBright);
+             g_cfgStart, g_gammaDim, g_wheelTray, g_wheelPanel, g_keyBright, g_hookDead ? 1 : 0);
     t += b;
     swprintf(b, 320, L"\r\nhotkeys: up=%ls down=%ls show=%ls",
              HotkeyText(g_hkUpMod, g_hkUpVk).c_str(),
@@ -1811,8 +1906,6 @@ static void DrawTracked(Graphics& g, const wchar_t* s, Font& f, Brush& b,
 
 // ---------------------------------------------------------------- 主面板
 
-static void DrawSettingsPage(Graphics& g, int W, int H);
-static void DrawCalibPage(Graphics& g, int W, int H);
 static void DrawMonitorMenu(Graphics& g, int W, int H);
 
 // 卡片内投影：沿四边的暗角渐变，增强悬浮层次。分层窗口下卡片外全透明，
@@ -1835,8 +1928,6 @@ static void CardInsetShadow(Graphics& g, int W, int H) {
 }
 
 static void DrawPanel(Graphics& g, int W, int H) {
-    if (g_page == 1) { DrawSettingsPage(g, W, H); return; }
-    if (g_page == 2) { DrawCalibPage(g, W, H); return; }
     LinearGradientBrush bg(PointF(0, 0), PointF((float)W, (float)H), g_pal.bg1, g_pal.bg2);
     GraphicsPath card;
     RoundRect(card, RectF(0, 0, (float)W, (float)H), 40.f);
@@ -2010,13 +2101,13 @@ static void DrawPanel(Graphics& g, int W, int H) {
     }
     std::wstring shown = full;
     if (shown.size() > 14) shown = shown.substr(0, 13) + L"…";
-    Font fp(L"Microsoft YaHei UI", 14, FontStyleRegular, UnitPixel);
+    Font fp(L"Microsoft YaHei UI", FS(14.f), FontStyleRegular, UnitPixel);
     g.DrawString(shown.c_str(), -1, &fp,
                  RectF(pill.X, pill.Y, pill.Width - 22, pill.Height), &sf, &tb);
 
     // 悬停显示完整名称
     if (g_hover == 0 && full.size() > 14) {
-        Font ft(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
+        Font ft(L"Microsoft YaHei UI", FS(12.f), FontStyleRegular, UnitPixel);
         RectF box;
         g.MeasureString(full.c_str(), -1, &ft, PointF(0, 0), &box);
         float tw = box.Width + 28, th = 30;
@@ -2059,14 +2150,14 @@ static void DrawPanel(Graphics& g, int W, int H) {
                                 g_pal.prog.GetR(), g_pal.prog.GetG(), g_pal.prog.GetB())
                         : Color(0, 0, 0, 0), 2.5f);
         g.DrawPath(&glow, &cp);
-        Font fh2(L"Consolas", 12, FontStyleBold, UnitPixel);
+        Font fh2(L"Consolas", FS(12.f), FontStyleBold, UnitPixel);
         SolidBrush ctb(g_pal.prog);
         g.DrawString(L"HDR", -1, &fh2, chip, &sf, &ctb);
     }
 
     // 提示：HDR 激活时显示 Windows 白电平（滑条镜像）与 lumen 调光比例，两数语义分明
     SolidBrush hb(g_pal.hint);
-    Font fh(L"Microsoft YaHei UI", 10, FontStyleRegular, UnitPixel);
+    Font fh(L"Microsoft YaHei UI", FS(10.f), FontStyleRegular, UnitPixel);
     if (hdrNow) {
         wchar_t hb2[96];
         ULONG wl = 0;
@@ -2116,7 +2207,7 @@ static void DrawPanel(Graphics& g, int W, int H) {
 
     if (g_fail) {
         SolidBrush rb(g_pal.danger);
-        Font fr(L"Microsoft YaHei UI", 9, FontStyleRegular, UnitPixel);
+        Font fr(L"Microsoft YaHei UI", FS(9.f), FontStyleRegular, UnitPixel);
         g.DrawString(tr(S_FAIL), -1, &fr, RectF(0, (float)H - 18, (float)W, 14), &sf, &rb);
     }
 
@@ -2208,6 +2299,17 @@ static void PlacePanel() {
 }
 
 static void PresentPanel(HWND hwnd);   // 定义在下方
+static void DrawSubPageCard(Graphics& g, int W, int H);
+static void DrawSettingsChrome(Graphics& g, int W, int H);
+static void DrawSettingsContent(Graphics& g, int W, int H);
+static void DrawSettingsStatus(Graphics& g, int W, int H);
+static void DrawCalibChrome(Graphics& g, int W, int H);
+static void DrawCalibContent(Graphics& g, int W, int H);
+static void DrawScrollbar(Graphics& g, int W, int H, int contentEnd);
+static int  SubScrollMax();
+static void DoCalWL();        // 标定 HDR 基准亮度（托盘/设置页共用）
+static void DoCalWheel();     // 校准滚轮图标位置
+static void DoGammaToggle();  // 软件调光开关
 
 static void OnPanelPaint(HWND hwnd) {
     PAINTSTRUCT ps;
@@ -2223,44 +2325,96 @@ static void PresentPanel(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     int w = rc.right, h = rc.bottom;
     if (w <= 0 || h <= 0) return;
+    float k = g_dpi / 96.0f * UI_SCALE;
+    int Wl = (int)lroundf(w / k), Hl = (int)lroundf(h / k);
 
-    Bitmap buf(w, h, PixelFormat32bppPARGB);
-    Graphics g(&buf);
+    if (!g_presBmp || g_presW != w || g_presH != h) {
+        delete g_presBmp; g_presBmp = nullptr;
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;              // top-down 与 GDI+ 行序一致
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HDC hdcScreen = GetDC(hwnd);
+        HDC mem = CreateCompatibleDC(hdcScreen);
+        HBITMAP dib = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        ReleaseDC(hwnd, hdcScreen);
+        if (!mem || !dib) { if (mem) DeleteDC(mem); if (dib) DeleteObject(dib); return; }
+        if (g_presDC) { if (g_presDIB) DeleteObject(g_presDIB); DeleteDC(g_presDC); }
+        g_presDC = mem;
+        g_presDIB = dib;
+        SelectObject(g_presDC, g_presDIB);
+        g_presBmp = new Bitmap(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        g_presW = w; g_presH = h;
+    }
+    Graphics g(g_presBmp);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
-    float k = g_dpi / 96.0f * UI_SCALE;
     g.ScaleTransform(k, k);
-    // 逻辑尺寸由实际客户区反推：设置页比主面板高，窗口随页面切换加高/复原
-    DrawPanel(g, (int)lroundf(w / k), (int)lroundf(h / k));
 
-    BitmapData bd{};
-    Rect full(0, 0, w, h);
-    if (buf.LockBits(&full, ImageLockModeRead, PixelFormat32bppPARGB, &bd) != Ok) return;
+    if (g_page == 0) {
+        DrawPanel(g, Wl, Hl);                    // 主面板：矢量直画（低频重绘）
+    } else {
+        int sepL = (g_page == 1) ? 96 : 102;
+        int cntHl = (g_page == 1) ? SettingsPageH() : 160 + (int)g_mons.size() * 52;
+        int cntH = (int)(cntHl * k);
 
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;              // top-down 与 GDI+ 行序一致
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HDC hdcScreen = GetDC(hwnd);
-    HDC mem = CreateCompatibleDC(hdcScreen);
-    HBITMAP dib = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (dib && bits) {
-        memcpy(bits, bd.Scan0, (size_t)w * h * 4);
-        HGDIOBJ old = SelectObject(mem, dib);
-        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-        POINT src{ 0, 0 };
-        SIZE size{ w, h };
-        UpdateLayeredWindow(hwnd, hdcScreen, nullptr, &size, mem, &src, 0, &bf, ULW_ALPHA);
-        SelectObject(mem, old);
-        DeleteObject(dib);
+        // 滚动收敛：内容变化（折叠/显示器增减）后越界部分回到可视范围
+        int maxS = SubScrollMax();
+        if (g_subScroll > maxS) g_subScroll = maxS;
+        if (g_subScroll < 0) g_subScroll = 0;
+
+        if (g_pageCacheDirty || g_chromePage != g_page || !g_chromeBmp || g_chromeW != w || g_chromeH != h) {
+            delete g_chromeBmp;
+            g_chromeBmp = new Bitmap(w, h, PixelFormat32bppPARGB);
+            Graphics cg(g_chromeBmp);
+            cg.SetSmoothingMode(SmoothingModeAntiAlias);
+            cg.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+            cg.ScaleTransform(k, k);
+            DrawSubPageCard(cg, Wl, Hl);
+            if (g_page == 1) DrawSettingsChrome(cg, Wl, Hl); else DrawCalibChrome(cg, Wl, Hl);
+            g_chromeW = w; g_chromeH = h; g_chromePage = g_page;
+        }
+        if (g_pageCacheDirty || g_cntPage != g_page || !g_cntBmp || g_cntW != w || g_cntH != cntH) {
+            delete g_cntBmp;
+            g_cntBmp = new Bitmap(w, cntH > 0 ? cntH : 1, PixelFormat32bppPARGB);
+            Graphics cn(g_cntBmp);
+            cn.SetSmoothingMode(SmoothingModeAntiAlias);
+            cn.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+            cn.ScaleTransform(k, k);
+            // 内容按逻辑坐标直画（位图 y = 逻辑 y × k），不预平移——滚动偏移全部由 blit 源坐标承担。
+            // 之前在平移前 SetClip 的做法会裁掉位图顶部 82px（clip 固定在设备坐标，不随 translate 移动），
+            // 导致前两行控件和组标题消失（issue 反馈的"遮挡/选项缺失"）。
+            if (g_page == 1) DrawSettingsContent(cn, Wl, Hl); else DrawCalibContent(cn, Wl, Hl);
+            g_cntW = w; g_cntH = cntH; g_cntPage = g_page;
+            g_pageCacheDirty = false;    // 重建完成：不清零的话每帧都整页重绘，缓存优化失效
+        }
+
+        // DrawImage 的目标矩形在缩放后的逻辑坐标系里（合成目标已 ScaleTransform(k)），
+        // 用物理像素尺寸会缩小成 k 倍 → 露出下层残留帧。源矩形保持位图像素（UnitPixel）。
+        g.DrawImage(g_chromeBmp, RectF(0.f, 0.f, (float)Wl, (float)Hl));
+        // content 位图内坐标 = (逻辑Y − sepL) × k；屏幕可见区从逻辑 98 起、状态行上方 44px 止
+        float clipTopL = 98.f;
+        float clipHl = (float)Hl - clipTopL - 44.f;
+        g.SetInterpolationMode(InterpolationModeNearestNeighbor);
+        // 源宽度必须是位图物理宽 w：此前误用 Wl（400 逻辑）→ 源 400px 映到目标 344px，
+        // 内容层整体多压一次 k（k²），绘制位置比命中区左偏 1/k，控件看着偏左、点击没反应
+        g.DrawImage(g_cntBmp, RectF(0.f, clipTopL, (float)Wl, clipHl),
+                    RectF(0.f, (clipTopL + g_subScroll) * k, (float)w, clipHl * k), UnitPixel);
+        if (g_page == 1) DrawSettingsStatus(g, Wl, Hl);
+        DrawScrollbar(g, Wl, Hl, (g_page == 1) ? SettingsPageH() - 56
+                                               : 160 + (int)g_mons.size() * 52);
     }
-    DeleteDC(mem);
+
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    POINT src{ 0, 0 };
+    SIZE size{ w, h };
+    HDC hdcScreen = GetDC(hwnd);
+    UpdateLayeredWindow(hwnd, hdcScreen, nullptr, &size, g_presDC, &src, 0, &bf, ULW_ALPHA);
     ReleaseDC(hwnd, hdcScreen);
-    buf.UnlockBits(&bd);
 }
 
 // ---------------------------------------------------------------- OSD
@@ -2295,10 +2449,10 @@ static void OnOsdPaint(HWND hwnd) {
     Pen edge(g_pal.border, 1.f);
     g.DrawPath(&edge, &p);
 
-    Font fsub(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
+    Font fsub(L"Microsoft YaHei UI", FS(12.f), FontStyleRegular, UnitPixel);
     SolidBrush sb(g_pal.osdSub);
     if (g_osdMode[0]) {
-        Font fm(L"Microsoft YaHei UI", 20, FontStyleBold, UnitPixel);
+        Font fm(L"Microsoft YaHei UI", FS(20.f), FontStyleBold, UnitPixel);
         SolidBrush tb(g_pal.osdText);
         StringFormat cen;
         cen.SetAlignment(StringAlignmentCenter);
@@ -2336,13 +2490,22 @@ static void ShowOsdNow() {
     }
     RECT wa = SafeWorkArea(g_msg);
     int w = Scale(190), h = Scale(62), m = Scale(11);
-    int x = wa.right - w - m;
-    int y = wa.top + m;
-    SetWindowPos(g_osd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-    BindRound(g_osd, w, h, 18);
+    int x, y;
+    if (g_osdPos.x >= 0 && g_osdPos.y >= 0) {
+        // 拖动记忆的位置，clamp 进当前工作区：拔屏/改分辨率后不会留在外面
+        x = std::max((int)wa.left,  std::min((int)g_osdPos.x, (int)wa.right - w));
+        y = std::max((int)wa.top,   std::min((int)g_osdPos.y, (int)wa.bottom - h));
+    } else {
+        x = wa.right - w - m;
+        y = wa.top + m;
+    }
+    if (!g_osdDrag) {                     // 拖动中不重定位、不重设定时器（避免拖到一半被隐藏/复位）
+        SetWindowPos(g_osd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+        BindRound(g_osd, w, h, 18);
+    }
     ShowWindow(g_osd, SW_SHOWNOACTIVATE);
     InvalidateRect(g_osd, nullptr, FALSE);
-    SetTimer(g_osd, 1, 1400, nullptr);
+    if (!g_osdDrag) SetTimer(g_osd, 1, 1400, nullptr);
 }
 
 static void ShowOsd() {
@@ -2381,40 +2544,173 @@ static void MiniButton(Graphics& g, float x, float y, bool plus) {
     if (plus) g.DrawLine(&pp, x + 15, y + 9, x + 15, y + 21);
 }
 
-// ---- 设置页几何：绘制与命中判定共用同一组矩形，避免两处漂移
-static const float SET_L = 36.f, SET_R = 364.f;
-static const float SET_HK = 394.f, SET_HK_STEP = 44.f;
+// ---- 设置页几何：折叠分组布局，绘制与命中判定共用同一份计算，避免两处漂移
+static const float SET_L = 36.f, SET_R = 374.f;   // 右缘贴近滚动条（391），不再留大空档
+static const float SET_HH    = 34.f;   // 分组标题行高
+static const float SET_ROW   = 52.f;   // 通用 / 鼠标与键盘 / 关于 行高
+static const float SET_HKROW = 44.f;   // 快捷键行高
 
-static float  SetRowY(int i)          { return 112.f + i * 52.f; }
+struct SetLay {
+    float hdrY[4];    // 各组标题 Y（组 1..3 的分隔线画在 hdrY-12）
+    float bodyY[4];   // 展开时 body 首行 Y
+    float total;      // 页面总高
+};
+
+static SetLay g_setLay;
+static void RefreshSetLayout() {
+    static const float bodyH[4] = { 9 * SET_ROW, 3 * SET_HKROW, 4 * SET_ROW, 2 * SET_ROW };
+    float y = 104.f;                       // 首组标题（页首分隔线 y=96 下方）
+    for (int i = 0; i < 4; ++i) {
+        if (i > 0) y += 8.f;               // 组间距（容纳上方分隔线）
+        g_setLay.hdrY[i] = y;
+        y += SET_HH;
+        g_setLay.bodyY[i] = y;
+        if (g_setFold & (1 << i)) y += bodyH[i];
+    }
+    g_setLay.total = y + 56.f;             // body 底 + 状态行(40) + 底边距
+}
+
+static int SettingsPageH() { RefreshSetLayout(); return (int)g_setLay.total; }   // 内容总高（含底部留白 56）
+
+static RectF SetHeaderRect(int i) {
+    // 高度取 SET_HH（不到 bodyY）：标题带与展开后首行控件之间不留重叠，命中判定优先级是标题在前
+    return RectF(SET_L - 8.f, g_setLay.hdrY[i] - 5.f, SET_R - SET_L + 16.f, SET_HH);
+}
+
+// 行坐标：全部从当前折叠布局取 Y，绘制与命中共用
+static float SetRowY(int i)      { return g_setLay.bodyY[0] + i * SET_ROW; }
+static float SetHkY(int i)       { return g_setLay.bodyY[1] + i * SET_HKROW; }
+static float SetMouseRowY(int i) { return g_setLay.bodyY[2] + i * SET_ROW; }
+static float SetAboutRowY()      { return g_setLay.bodyY[3]; }
+
 static RectF  SetToggleRect(int i)    { return RectF(SET_R - 44.f, SetRowY(i) - 4.f, 44.f, 24.f); }
-// 第 2/3 行双列：左列 时间，右列 亮度，各自带加减
-static RectF  SetTimeValueRect(int i) { return RectF(96.f,  SetRowY(i) - 6.f, 40.f, 28.f); }
-static RectF  SetTimeMinusRect(int i) { return RectF(140.f, SetRowY(i) - 6.f, 30.f, 30.f); }
-static RectF  SetTimePlusRect(int i)  { return RectF(172.f, SetRowY(i) - 6.f, 30.f, 30.f); }
-static RectF  SetPctValueRect(int i)  { return RectF(258.f, SetRowY(i) - 6.f, 42.f, 28.f); }
-static RectF  SetPctMinusRect(int i)  { return RectF(302.f, SetRowY(i) - 6.f, 30.f, 30.f); }
-static RectF  SetPctPlusRect(int i)   { return RectF(334.f, SetRowY(i) - 6.f, 30.f, 30.f); }
+// 第 2/3 行双列：左列 时间，右列 亮度，各自带加减（值矩形按 120% 字体不折行留足宽度）
+static RectF  SetTimeValueRect(int i) { return RectF(96.f,  SetRowY(i) - 6.f, 48.f, 28.f); }
+static RectF  SetTimeMinusRect(int i) { return RectF(146.f, SetRowY(i) - 6.f, 30.f, 30.f); }
+static RectF  SetTimePlusRect(int i)  { return RectF(178.f, SetRowY(i) - 6.f, 30.f, 30.f); }
+static RectF  SetPctValueRect(int i)  { return RectF(268.f, SetRowY(i) - 6.f, 42.f, 28.f); }
+static RectF  SetPctMinusRect(int i)  { return RectF(312.f, SetRowY(i) - 6.f, 30.f, 30.f); }
+static RectF  SetPctPlusRect(int i)   { return RectF(344.f, SetRowY(i) - 6.f, 30.f, 30.f); }
 // 第 4 行左右各半：左 DDC 间隔，右 步长
-static RectF  SetDdcValue()           { return RectF(110.f, SetRowY(4) - 6.f, 54.f, 28.f); }
-static RectF  SetDdcMinus()           { return RectF(168.f, SetRowY(4) - 6.f, 30.f, 30.f); }
-static RectF  SetDdcPlus()            { return RectF(198.f, SetRowY(4) - 6.f, 30.f, 30.f); }
-static RectF  SetStepValue()          { return RectF(272.f, SetRowY(4) - 6.f, 26.f, 28.f); }
-static RectF  SetStepMinus()          { return RectF(302.f, SetRowY(4) - 6.f, 30.f, 30.f); }
-static RectF  SetStepPlus()           { return RectF(334.f, SetRowY(4) - 6.f, 30.f, 30.f); }
-static RectF  SetEditRect(int i)      { return RectF(SET_R - 72.f, SET_HK + i * SET_HK_STEP, 72.f, 30.f); }
-static RectF  SetKeyRect(int i)       { return RectF(96.f, SET_HK + i * SET_HK_STEP, 190.f, 30.f); }
+static RectF  SetDdcValue()           { return RectF(114.f, SetRowY(4) - 6.f, 54.f, 28.f); }
+static RectF  SetDdcMinus()           { return RectF(170.f, SetRowY(4) - 6.f, 30.f, 30.f); }
+static RectF  SetDdcPlus()            { return RectF(200.f, SetRowY(4) - 6.f, 30.f, 30.f); }
+static RectF  SetStepValue()          { return RectF(282.f, SetRowY(4) - 6.f, 26.f, 28.f); }
+static RectF  SetStepMinus()          { return RectF(312.f, SetRowY(4) - 6.f, 30.f, 30.f); }
+static RectF  SetStepPlus()           { return RectF(344.f, SetRowY(4) - 6.f, 30.f, 30.f); }
+static RectF  SetEditRect(int i)      { return RectF(SET_R - 72.f, SetHkY(i), 72.f, 30.f); }
+static RectF  SetKeyRect(int i)       { return RectF(96.f, SetHkY(i), 190.f, 30.f); }
 static RectF  SetBackRect()           { return RectF(16.f, 8.f, 120.f, 44.f); }
-// 鼠标设置分组：快捷键区下方，设置页加高后放在页尾
-static const float SET_MOUSE_SEP = 524.f;
-static float SetMouseRowY(int i)      { return 562.f + i * 52.f; }
 static RectF  SetMouseToggleRect(int i) { return RectF(SET_R - 44.f, SetMouseRowY(i) - 4.f, 44.f, 24.f); }
+static RectF  SetHomeRect()           { return RectF(SET_L - 8.f, SetAboutRowY() - 6.f, SET_R - SET_L + 16.f, 34.f); }
+// 通用组第 6/7 行（新增）：语言整行点击循环切换；字体大小带加减
+static RectF  SetLangRect()           { return RectF(SET_L - 8.f, SetRowY(5) - 6.f, SET_R - SET_L + 16.f, 34.f); }
+static RectF  SetLangValueRect()      { return RectF(SET_R - 130.f, SetRowY(5) - 2.f, 130.f, 28.f); }
+static RectF  SetFontValueRect()      { return RectF(260.f, SetRowY(6) - 6.f, 50.f, 28.f); }
+static RectF  SetFontMinusRect()      { return RectF(312.f, SetRowY(6) - 6.f, 30.f, 30.f); }
+static RectF  SetFontPlusRect()       { return RectF(344.f, SetRowY(6) - 6.f, 30.f, 30.f); }
+// 自托盘菜单迁入的功能行：软件调光(行7 开关) / 标定 HDR(行8 整行) / 校准滚轮(鼠标组行3) / 复制诊断(关于组行1)
+static RectF  SetCalWLRect()          { return RectF(SET_L - 8.f, SetRowY(8) - 6.f, SET_R - SET_L + 16.f, 34.f); }
+static RectF  SetCalWheelRect()       { return RectF(SET_L - 8.f, SetMouseRowY(3) - 6.f, SET_R - SET_L + 16.f, 34.f); }
+static RectF  SetDiagRect()           { return RectF(SET_L - 8.f, SetAboutRowY() + SET_ROW - 6.f, SET_R - SET_L + 16.f, 34.f); }
+
+// 子页滚动上限：内容底部 + 8px 余量 − 可视区底部（状态行上方留 48px）；页高固定 570
+static int SubScrollMax() {
+    int end = (g_page == 2) ? (160 + (int)g_mons.size() * 52)
+                            : SettingsPageH() - 56;
+    int maxS = end + 8 - (PANEL_H - 48);
+    return maxS > 0 ? maxS : 0;
+}
+
+// 滚轮缓动：目标位置 100ms 内到位（timer 8 @16ms，每帧走剩余的 ~1/4），滚动帧只做位图搬运
+static void ScrollTo(int ny) {
+    int maxS = SubScrollMax();
+    if (ny > maxS) ny = maxS;
+    if (ny < 0) ny = 0;
+    if (ny == g_subScroll) return;
+    g_scrollTo = ny;
+    if (!g_scrollAnim && g_msg) { g_scrollAnim = true; SetTimer(g_msg, 8, 16, nullptr); }
+}
+
+static void ScrollAnimTick() {
+    if (!g_scrollAnim) return;
+    int d = g_scrollTo - g_subScroll;
+    if (d == 0) { g_scrollAnim = false; KillTimer(g_msg, 8); return; }
+    int step = d / 4;
+    if (step == 0) step = (d > 0) ? 1 : -1;
+    g_subScroll += step;
+    if (g_subScroll == g_scrollTo) { g_scrollAnim = false; KillTimer(g_msg, 8); }
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// 滚动条几何：绘制与拖动共用（thumb 中心跟随按点，按住可拖）
+static void ScrollbarGeom(int contentEnd, float& trackY0, float& viewH, float& thumbH, int& maxS) {
+    trackY0 = 102.f;
+    float trackY1 = (float)PANEL_H - 46.f;
+    viewH = trackY1 - trackY0;
+    float contentH = (float)contentEnd + 8.f;
+    thumbH = viewH * viewH / contentH;
+    if (thumbH < 28.f) thumbH = 28.f;
+    maxS = SubScrollMax();
+}
+
+// 拖动/点按位置 → 滚动偏移：thumb 中心对齐按点
+static int ScrollFromDragY(int y, int contentEnd) {
+    float trackY0, viewH, thumbH; int maxS;
+    ScrollbarGeom(contentEnd, trackY0, viewH, thumbH, maxS);
+    if (viewH - thumbH <= 0 || maxS <= 0) return 0;
+    float rel = ((float)y - trackY0 - thumbH / 2.f) / (viewH - thumbH);
+    int ny = (int)(rel * maxS + 0.5f);
+    if (ny < 0) ny = 0;
+    if (ny > maxS) ny = maxS;
+    return ny;
+}
+
+static void DrawScrollbar(Graphics& g, int W, int H, int contentEnd) {
+    float trackY0, viewH, thumbH; int maxS;
+    ScrollbarGeom(contentEnd, trackY0, viewH, thumbH, maxS);
+    if (maxS <= 0) return;
+    float pos = trackY0 + (viewH - thumbH) * (float)g_subScroll / (float)maxS;
+    GraphicsPath trk;
+    RoundRect(trk, RectF((float)W - 9.f, trackY0, 4.f, viewH), 2.f);
+    SolidBrush tb(g_pal.pillEdge);
+    g.FillPath(&tb, &trk);
+    GraphicsPath th;
+    RoundRect(th, RectF((float)W - 9.f, pos, 4.f, thumbH), 2.f);
+    SolidBrush hb(g_pal.sub);
+    g.FillPath(&hb, &th);
+}
 
 static bool InRect(const RectF& r, int x, int y) {
     return x >= r.X && x <= r.X + r.Width && y >= r.Y && y <= r.Y + r.Height;
 }
 
-static void DrawSettingsPage(Graphics& g, int W, int H) {
-    // 与主面板完全同源的卡片：同一渐变、同一 40 px 圆角、同一描边、同一内投影
+// 分组标题右侧的展开指示：展开=向下 V，收起=向右 >
+static void DrawChevron(Graphics& g, float cx, float cy, bool open, Color c) {
+    Pen p(c, 2.f);
+    p.SetStartCap(LineCapRound);
+    p.SetEndCap(LineCapRound);
+    if (open) {
+        g.DrawLine(&p, cx - 5.f, cy - 2.f, cx, cy + 3.f);
+        g.DrawLine(&p, cx, cy + 3.f, cx + 5.f, cy - 2.f);
+    } else {
+        g.DrawLine(&p, cx - 2.f, cy - 5.f, cx + 3.f, cy);
+        g.DrawLine(&p, cx + 3.f, cy, cx - 2.f, cy + 5.f);
+    }
+}
+
+// 外链箭头 ↗（「项目主页」行尾）
+static void DrawExtArrow(Graphics& g, float cx, float cy, Color c) {
+    Pen p(c, 2.f);
+    p.SetStartCap(LineCapRound);
+    p.SetEndCap(LineCapRound);
+    g.DrawLine(&p, cx - 5.f, cy + 5.f, cx + 4.f, cy - 4.f);
+    g.DrawLine(&p, cx, cy - 5.f, cx + 5.f, cy - 5.f);
+    g.DrawLine(&p, cx + 5.f, cy - 5.f, cx + 5.f, cy);
+}
+
+// 子页公共卡片：渐变 + 40px 圆角 + 描边 + 内投影（chrome 缓存层，主题/DPI 变化才重建）
+static void DrawSubPageCard(Graphics& g, int W, int H) {
     LinearGradientBrush bg(PointF(0, 0), PointF(0, (float)H), g_pal.bg1, g_pal.bg2);
     GraphicsPath card;
     RoundRect(card, RectF(0, 0, (float)W, (float)H), 40.f);
@@ -2422,17 +2718,32 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
     Pen border(g_pal.pillEdge, 1.f);
     g.DrawPath(&border, &card);
     CardInsetShadow(g, W, H);
+}
 
+// 设置页页眉（固定不滚）：返回 + 标题 + 分隔线
+static void DrawSettingsChrome(Graphics& g, int W, int H) {
+    SolidBrush tb(g_pal.text);
+    SolidBrush sb(g_pal.sub);
+    Font fb(L"Microsoft YaHei UI", FS(14.f), FontStyleRegular, UnitPixel);
+    Font ft(L"Microsoft YaHei UI", FS(22.f), FontStyleBold, UnitPixel);
+    StringFormat cen;
+    cen.SetAlignment(StringAlignmentCenter);
+    cen.SetLineAlignment(StringAlignmentCenter);
+    g.DrawString(tr(S_BACK), -1, &fb, PointF(28, 18), &sb);
+    g.DrawString(tr(S_SETTINGS), -1, &ft, RectF(0, 46, (float)W, 32), &cen, &tb);
+    Pen sep(g_pal.pillEdge, 1.f);
+    g.DrawLine(&sep, SET_L, 96.f, SET_R, 96.f);
+}
+
+// 设置页内容层（随滚动平移，绘制进缓存位图）：折叠标题 + 各组 + 关于
+static void DrawSettingsContent(Graphics& g, int W, int H) {
     SolidBrush tb(g_pal.text);
     SolidBrush sb(g_pal.sub);
     SolidBrush acc(g_dark ? g_pal.prog : g_pal.progDot);
-    Font fb(L"Microsoft YaHei UI", 14, FontStyleRegular, UnitPixel);
-    Font ft(L"Microsoft YaHei UI", 22, FontStyleBold, UnitPixel);
-    Font fl(L"Microsoft YaHei UI", 15, FontStyleRegular, UnitPixel);
-    Font fv(L"Microsoft YaHei UI", 15, FontStyleBold, UnitPixel);
-    Font fs(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
-    Font fsec(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
-
+    Font fl(L"Microsoft YaHei UI", FS(15.f), FontStyleRegular, UnitPixel);
+    Font fv(L"Microsoft YaHei UI", FS(15.f), FontStyleBold, UnitPixel);
+    Font fs(L"Microsoft YaHei UI", FS(12.f), FontStyleRegular, UnitPixel);
+    Font fsec(L"Microsoft YaHei UI", FS(12.f), FontStyleRegular, UnitPixel);
     StringFormat cen;
     cen.SetAlignment(StringAlignmentCenter);
     cen.SetLineAlignment(StringAlignmentCenter);
@@ -2440,94 +2751,143 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
     rgt.SetAlignment(StringAlignmentFar);
     rgt.SetLineAlignment(StringAlignmentCenter);
 
-    g.DrawString(tr(S_BACK), -1, &fb, PointF(28, 18), &sb);
-    g.DrawString(tr(S_SETTINGS), -1, &ft, RectF(0, 46, (float)W, 32), &cen, &tb);
-
+    RefreshSetLayout();
     Pen sep(g_pal.pillEdge, 1.f);
-    g.DrawLine(&sep, SET_L, 96.f, SET_R, 96.f);
+    // 分组标题：通用 / 全局快捷键 / 鼠标与键盘 / 关于；右侧矢量 chevron 指示展开态
+    static const int setTitles[4] = { S_GENERAL, S_HOTKEYS, S_MOUSESET, S_ABOUT };
+    for (int gi = 0; gi < 4; ++gi) {
+        if (gi > 0) g.DrawLine(&sep, SET_L, g_setLay.hdrY[gi] - 12.f, SET_R, g_setLay.hdrY[gi] - 12.f);
+        if (g_setHeaderHover == gi) {
+            GraphicsPath hp;
+            RoundRect(hp, SetHeaderRect(gi), 11.f);
+            SolidBrush hb(g_pal.menuHover);
+            g.FillPath(&hb, &hp);
+        }
+        g.DrawString(tr(setTitles[gi]), -1, &fsec, PointF(SET_L, g_setLay.hdrY[gi]), &tb);
+        DrawChevron(g, SET_R - 12.f, g_setLay.hdrY[gi] + 15.f, (g_setFold & (1 << gi)) != 0, g_pal.sub);
+    }
 
     wchar_t buf[32];
-    g.DrawString(tr(S_AUTOSTART), -1, &fl, PointF(SET_L, SetRowY(0)), &tb);
-    g.DrawString(tr(S_AUTOBR), -1, &fl, PointF(SET_L, SetRowY(1)), &tb);
+    if (g_setFold & 1) {   // 通用
+        g.DrawString(tr(S_AUTOSTART), -1, &fl, PointF(SET_L, SetRowY(0)), &tb);
+        g.DrawString(tr(S_AUTOBR), -1, &fl, PointF(SET_L, SetRowY(1)), &tb);
 
-    ToggleTrack(g, SetToggleRect(0).X, SetToggleRect(0).Y, g_cfgStart != 0, g_dark);
-    ToggleTrack(g, SetToggleRect(1).X, SetToggleRect(1).Y, g_cfgAuto != 0, g_dark);
+        ToggleTrack(g, SetToggleRect(0).X, SetToggleRect(0).Y, g_cfgStart != 0, g_dark);
+        ToggleTrack(g, SetToggleRect(1).X, SetToggleRect(1).Y, g_cfgAuto != 0, g_dark);
 
-    Font fv13(L"Microsoft YaHei UI", 13, FontStyleBold, UnitPixel);
-    Font fv12(L"Microsoft YaHei UI", 12, FontStyleBold, UnitPixel);   // 双列数值：12px 才放得下 "08:00" 不折行
-    for (int i = 2; i <= 3; ++i) {
-        // 左列：时间；右列：到点后的目标亮度，两列同排
-        g.DrawString(i == 2 ? tr(S_STARTH) : tr(S_ENDH), -1, &fl, PointF(SET_L, SetRowY(i)), &sb);
-        g.DrawString(i == 2 ? tr(S_DAYBR) : tr(S_NIGHTBR), -1, &fs, PointF(206.f, SetRowY(i) + 2), &sb);
+        Font fv13(L"Microsoft YaHei UI", FS(13.f), FontStyleBold, UnitPixel);
+        Font fv12(L"Microsoft YaHei UI", FS(12.f), FontStyleBold, UnitPixel);   // 双列数值：12px 才放得下 "08:00" 不折行
+        for (int i = 2; i <= 3; ++i) {
+            // 左列：时间；右列：到点后的目标亮度，两列同排
+            g.DrawString(i == 2 ? tr(S_STARTH) : tr(S_ENDH), -1, &fl, PointF(SET_L, SetRowY(i)), &sb);
+            g.DrawString(i == 2 ? tr(S_DAYBR) : tr(S_NIGHTBR), -1, &fs, PointF(216.f, SetRowY(i) + 2), &sb);
 
-        swprintf(buf, 32, L"%02d:00", i == 2 ? g_cfgStartH : g_cfgEndH);
-        g.DrawString(buf, -1, &fv12, SetTimeValueRect(i), &rgt, &tb);
-        MiniButton(g, SetTimeMinusRect(i).X, SetTimeMinusRect(i).Y, false);
-        MiniButton(g, SetTimePlusRect(i).X, SetTimePlusRect(i).Y, true);
+            swprintf(buf, 32, L"%02d:00", i == 2 ? g_cfgStartH : g_cfgEndH);
+            g.DrawString(buf, -1, &fv12, SetTimeValueRect(i), &rgt, &tb);
+            MiniButton(g, SetTimeMinusRect(i).X, SetTimeMinusRect(i).Y, false);
+            MiniButton(g, SetTimePlusRect(i).X, SetTimePlusRect(i).Y, true);
 
-        swprintf(buf, 32, L"%d%%", i == 2 ? g_dayPct : g_nightPct);
-        g.DrawString(buf, -1, &fv12, SetPctValueRect(i), &rgt, &tb);
-        MiniButton(g, SetPctMinusRect(i).X, SetPctMinusRect(i).Y, false);
-        MiniButton(g, SetPctPlusRect(i).X, SetPctPlusRect(i).Y, true);
-    }
-    // 第 4 行：左 DDC 间隔 / 右 步长
-    g.DrawString(tr(S_DDC), -1, &fl, PointF(SET_L, SetRowY(4)), &tb);
-    swprintf(buf, 32, L"%d ms", g_cfgDelay);
-    g.DrawString(buf, -1, &fv13, SetDdcValue(), &rgt, &tb);
-    RectF dm = SetDdcMinus(), dp = SetDdcPlus();
-    MiniButton(g, dm.X, dm.Y, false);
-    MiniButton(g, dp.X, dp.Y, true);
-    g.DrawString(tr(S_STEP), -1, &fl, PointF(240.f, SetRowY(4)), &tb);
-    swprintf(buf, 32, L"%d", g_step);
-    g.DrawString(buf, -1, &fv13, SetStepValue(), &rgt, &tb);
-    RectF sm = SetStepMinus(), sp = SetStepPlus();
-    MiniButton(g, sm.X, sm.Y, false);
-    MiniButton(g, sp.X, sp.Y, true);
+            swprintf(buf, 32, L"%d%%", i == 2 ? g_dayPct : g_nightPct);
+            g.DrawString(buf, -1, &fv12, SetPctValueRect(i), &rgt, &tb);
+            MiniButton(g, SetPctMinusRect(i).X, SetPctMinusRect(i).Y, false);
+            MiniButton(g, SetPctPlusRect(i).X, SetPctPlusRect(i).Y, true);
+        }
+        // 第 4 行：左 DDC 间隔 / 右 步长
+        g.DrawString(tr(S_DDC), -1, &fl, PointF(SET_L, SetRowY(4)), &tb);
+        swprintf(buf, 32, L"%d ms", g_cfgDelay);
+        g.DrawString(buf, -1, &fv13, SetDdcValue(), &rgt, &tb);
+        RectF dm = SetDdcMinus(), dp = SetDdcPlus();
+        MiniButton(g, dm.X, dm.Y, false);
+        MiniButton(g, dp.X, dp.Y, true);
+        g.DrawString(tr(S_STEP), -1, &fl, PointF(250.f, SetRowY(4)), &tb);
+        swprintf(buf, 32, L"%d", g_step);
+        g.DrawString(buf, -1, &fv13, SetStepValue(), &rgt, &tb);
+        RectF sm = SetStepMinus(), sp = SetStepPlus();
+        MiniButton(g, sm.X, sm.Y, false);
+        MiniButton(g, sp.X, sp.Y, true);
 
-    g.DrawLine(&sep, SET_L, 356.f, SET_R, 356.f);
-    g.DrawString(tr(S_HOTKEYS), -1, &fsec, PointF(SET_L, 368), &tb);
+        // 第 6 行：语言（点击整行循环 跟随系统 → 中文 → English）
+        g.DrawString(tr(S_LANG), -1, &fl, PointF(SET_L, SetRowY(5)), &tb);
+        const wchar_t* lv = (g_langPref == 0) ? tr(S_FOLL) : (g_langPref == 1) ? L"中文" : L"English";
+        g.DrawString(lv, -1, &fv, SetLangValueRect(), &rgt, &tb);
 
-    for (int i = 0; i < 3; ++i) {
-        float y = SET_HK + i * SET_HK_STEP;
-        g.DrawString(i == 0 ? tr(S_UP) : i == 1 ? tr(S_DOWN) : tr(S_SHOWPILL), -1, &fl, PointF(SET_L, y + 6), &tb);
+        // 第 7 行：字体大小（90–120%，步进 10%）
+        g.DrawString(tr(S_FONTS), -1, &fl, PointF(SET_L, SetRowY(6)), &tb);
+        swprintf(buf, 32, L"%d%%", g_fontPct);
+        g.DrawString(buf, -1, &fv12, SetFontValueRect(), &rgt, &tb);
+        RectF fm = SetFontMinusRect(), fp2 = SetFontPlusRect();
+        MiniButton(g, fm.X, fm.Y, false);
+        MiniButton(g, fp2.X, fp2.Y, true);
 
-        RectF kr = SetKeyRect(i);
-        GraphicsPath kp;
-        RoundRect(kp, kr, 15.f);
-        SolidBrush kb(g_pal.pill);
-        g.FillPath(&kb, &kp);
-        Pen kpn(g_pal.pillEdge, 1.f);
-        g.DrawPath(&kpn, &kp);
+        // 第 8 行：软件调光（HDR 显示器用，自托盘迁入）
+        g.DrawString(tr(S_GAMMA), -1, &fl, PointF(SET_L, SetRowY(7)), &tb);
+        ToggleTrack(g, SetToggleRect(7).X, SetToggleRect(7).Y, g_gammaDim != 0, g_dark);
 
-        UINT hm = (i == 0) ? g_hkUpMod : (i == 1) ? g_hkDownMod : g_hkShowMod;
-        UINT hv = (i == 0) ? g_hkUpVk  : (i == 1) ? g_hkDownVk  : g_hkShowVk;
-        std::wstring txt;
-        if (g_capSlot == i + 1) txt = tr(S_PRESSKEY);
-        else txt = HotkeyText(hm, hv);
-        SolidBrush& tc = (g_capSlot == i + 1) ? acc : sb;
-        Font& kf = (g_capSlot == i + 1) ? fs : fl;
-        g.DrawString(txt.c_str(), -1, &kf, kr, &cen, &tc);
-
-        RectF er = SetEditRect(i);
-        GraphicsPath ep;
-        RoundRect(ep, er, 15.f);
-        SolidBrush eb(g_pal.pill);
-        g.FillPath(&eb, &ep);
-        Pen epn(g_pal.pillEdge, 1.f);
-        g.DrawPath(&epn, &ep);
-        g.DrawString(g_capSlot == i + 1 ? tr(S_CANCEL) : tr(S_MODIFY), -1, &fs, er, &cen, &tb);
+        // 第 9 行：标定 HDR 基准亮度（整行点击，气泡报结果）
+        g.DrawString(tr(S_CAL), -1, &fl, PointF(SET_L, SetRowY(8)), &tb);
     }
 
-    // 鼠标设置：两个滚轮开关（与页首开关同款绘制与命中矩形）
-    g.DrawLine(&sep, SET_L, SET_MOUSE_SEP, SET_R, SET_MOUSE_SEP);
-    g.DrawString(tr(S_MOUSESET), -1, &fsec, PointF(SET_L, SET_MOUSE_SEP + 12.f), &tb);
-    g.DrawString(tr(S_WHEELTRAY), -1, &fl, PointF(SET_L, SetMouseRowY(0)), &tb);
-    g.DrawString(tr(S_WHEELPANEL), -1, &fl, PointF(SET_L, SetMouseRowY(1)), &tb);
-    ToggleTrack(g, SetMouseToggleRect(0).X, SetMouseToggleRect(0).Y, g_wheelTray != 0, g_dark);
-    ToggleTrack(g, SetMouseToggleRect(1).X, SetMouseToggleRect(1).Y, g_wheelPanel != 0, g_dark);
-    g.DrawString(tr(S_KEYBRIGHT), -1, &fl, PointF(SET_L, SetMouseRowY(2)), &tb);
-    ToggleTrack(g, SetMouseToggleRect(2).X, SetMouseToggleRect(2).Y, g_keyBright != 0, g_dark);
+    if (g_setFold & 2) {   // 全局快捷键
+        for (int i = 0; i < 3; ++i) {
+            float y = SetHkY(i);
+            g.DrawString(i == 0 ? tr(S_UP) : i == 1 ? tr(S_DOWN) : tr(S_SHOWPILL), -1, &fl, PointF(SET_L, y + 6), &tb);
 
+            RectF kr = SetKeyRect(i);
+            GraphicsPath kp;
+            RoundRect(kp, kr, 15.f);
+            SolidBrush kb(g_pal.pill);
+            g.FillPath(&kb, &kp);
+            Pen kpn(g_pal.pillEdge, 1.f);
+            g.DrawPath(&kpn, &kp);
+
+            UINT hm = (i == 0) ? g_hkUpMod : (i == 1) ? g_hkDownMod : g_hkShowMod;
+            UINT hv = (i == 0) ? g_hkUpVk  : (i == 1) ? g_hkDownVk  : g_hkShowVk;
+            std::wstring txt;
+            if (g_capSlot == i + 1) txt = tr(S_PRESSKEY);
+            else txt = HotkeyText(hm, hv);
+            SolidBrush& tc = (g_capSlot == i + 1) ? acc : sb;
+            Font& kf = (g_capSlot == i + 1) ? fs : fl;
+            g.DrawString(txt.c_str(), -1, &kf, kr, &cen, &tc);
+
+            RectF er = SetEditRect(i);
+            GraphicsPath ep;
+            RoundRect(ep, er, 15.f);
+            SolidBrush eb(g_pal.pill);
+            g.FillPath(&eb, &ep);
+            Pen epn(g_pal.pillEdge, 1.f);
+            g.DrawPath(&epn, &ep);
+            g.DrawString(g_capSlot == i + 1 ? tr(S_CANCEL) : tr(S_MODIFY), -1, &fs, er, &cen, &tb);
+        }
+    }
+
+    if (g_setFold & 4) {   // 鼠标与键盘：三个开关（与页首开关同款绘制与命中矩形）+ 校准滚轮图标
+        g.DrawString(tr(S_WHEELTRAY), -1, &fl, PointF(SET_L, SetMouseRowY(0)), &tb);
+        g.DrawString(tr(S_WHEELPANEL), -1, &fl, PointF(SET_L, SetMouseRowY(1)), &tb);
+        ToggleTrack(g, SetMouseToggleRect(0).X, SetMouseToggleRect(0).Y, g_wheelTray != 0, g_dark);
+        ToggleTrack(g, SetMouseToggleRect(1).X, SetMouseToggleRect(1).Y, g_wheelPanel != 0, g_dark);
+        g.DrawString(tr(S_KEYBRIGHT), -1, &fl, PointF(SET_L, SetMouseRowY(2)), &tb);
+        ToggleTrack(g, SetMouseToggleRect(2).X, SetMouseToggleRect(2).Y, g_keyBright != 0, g_dark);
+        g.DrawString(tr(S_CALIB), -1, &fl, PointF(SET_L, SetMouseRowY(3)), &tb);   // 整行点击，自托盘迁入
+    }
+
+    if (g_setFold & 8) {   // 关于：项目主页（点击打开浏览器）+ 复制诊断信息（自托盘迁入）
+        float hy = SetAboutRowY();
+        Color lc = g_dark ? g_pal.prog : g_pal.progDot;
+        SolidBrush lb(lc);
+        g.DrawString(tr(S_HOME), -1, &fl, PointF(SET_L, hy), &lb);
+        RectF hm;
+        g.MeasureString(tr(S_HOME), -1, &fl, PointF(SET_L, hy), &hm);
+        Pen ulink(lc, 1.f);
+        g.DrawLine(&ulink, SET_L, hy + 21.f, SET_L + hm.Width, hy + 21.f);
+        DrawExtArrow(g, SET_L + hm.Width + 13.f, hy + 15.f, g_pal.sub);
+        g.DrawString(tr(S_DIAG), -1, &fl, PointF(SET_L, SetAboutRowY() + SET_ROW), &tb);
+    }
+}
+
+// 设置页状态行（固定层，每帧轻量矢量）：签名 / 热键错误红字 / 钩子失败提示 + 右下角版本号
+static void DrawSettingsStatus(Graphics& g, int W, int H) {
+    SolidBrush sb(g_pal.sub);
+    Font fs(L"Microsoft YaHei UI", FS(12.f), FontStyleRegular, UnitPixel);
     SolidBrush eb(g_pal.danger);
     SolidBrush* msgBrush = &sb;
     const wchar_t* msg = tr(S_SIG);
@@ -2537,37 +2897,48 @@ static void DrawSettingsPage(Graphics& g, int W, int H) {
         msg = tr(S_NEEDMOD); msgBrush = &eb;
     } else if (g_capSlot) {
         msg = tr(S_NEEDMOD);
+    } else if (g_hookDead) {
+        msg = tr(S_HOOKFAIL); msgBrush = &eb;
     }
     g.DrawString(msg, -1, &fs, PointF(SET_L, H - 40.f), msgBrush);
+    StringFormat rgt;
+    rgt.SetAlignment(StringAlignmentFar);
+    wchar_t vb[32];
+    swprintf(vb, 32, L"v%ls", APP_VERSION);
+    g.DrawString(vb, -1, &fs, RectF(SET_R - 80.f, H - 40.f, 80.f, 16.f), &rgt, &sb);
 }
 
-// ---- 校准页（单屏偏移）：行距同设置页，右对齐到 364；只影响「全部显示器」同步
+// ---- 校准页（单屏偏移）：行距同设置页，右对齐到 SET_R；只影响「全部显示器」同步
 static float CalRowY(int i)       { return 128.f + i * 52.f; }
 static RectF  CalMinusRect(int i) { return RectF(236.f, CalRowY(i) - 4.f, 30.f, 30.f); }
-static RectF  CalPlusRect(int i)  { return RectF(334.f, CalRowY(i) - 4.f, 30.f, 30.f); }
+static RectF  CalPlusRect(int i)  { return RectF(344.f, CalRowY(i) - 4.f, 30.f, 30.f); }
 static RectF  CalResetRect()      { return RectF(SET_L, CalRowY((int)g_mons.size()) + 2.f, 130.f, 30.f); }
 
-static void DrawCalibPage(Graphics& g, int W, int H) {
-    // 与设置页完全同源的卡片：同一渐变、同一 40 px 圆角、同一描边、同一内投影
-    LinearGradientBrush bg(PointF(0, 0), PointF(0, (float)H), g_pal.bg1, g_pal.bg2);
-    GraphicsPath card;
-    RoundRect(card, RectF(0, 0, (float)W, (float)H), 40.f);
-    g.FillPath(&bg, &card);
-    Pen border(g_pal.pillEdge, 1.f);
-    g.DrawPath(&border, &card);
-    CardInsetShadow(g, W, H);
-
+// 校准页页眉（固定不滚）：返回 + 标题 + 提示 + 分隔线
+static void DrawCalibChrome(Graphics& g, int W, int H) {
     SolidBrush tb(g_pal.text);
     SolidBrush sb(g_pal.sub);
-    SolidBrush acc(g_dark ? g_pal.prog : g_pal.progDot);
-    Font fb(L"Microsoft YaHei UI", 14, FontStyleRegular, UnitPixel);
-    Font ft(L"Microsoft YaHei UI", 22, FontStyleBold, UnitPixel);
-    Font fs(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
-    Font fv(L"Microsoft YaHei UI", 15, FontStyleBold, UnitPixel);
-
+    Font ft(L"Microsoft YaHei UI", FS(22.f), FontStyleBold, UnitPixel);
+    Font fs(L"Microsoft YaHei UI", FS(12.f), FontStyleRegular, UnitPixel);
     StringFormat cen;
     cen.SetAlignment(StringAlignmentCenter);
     cen.SetLineAlignment(StringAlignmentCenter);
+    g.DrawString(tr(S_BACK), -1, &fs, PointF(28, 18), &sb);
+    g.DrawString(tr(S_OFFPG), -1, &ft, RectF(0, 46, (float)W, 32), &cen, &tb);
+    g.DrawString(tr(S_OFFHINT), -1, &fs, RectF(0, 80, (float)W, 16), &cen, &sb);
+    Pen sep(g_pal.pillEdge, 1.f);
+    g.DrawLine(&sep, SET_L, 102.f, SET_R, 102.f);
+}
+
+// 校准页内容层（随滚动平移，绘制进缓存位图）：逐屏偏移行 + 归零按钮
+static void DrawCalibContent(Graphics& g, int W, int H) {
+    SolidBrush tb(g_pal.text);
+    SolidBrush sb(g_pal.sub);
+    SolidBrush acc(g_dark ? g_pal.prog : g_pal.progDot);
+    Font fb(L"Microsoft YaHei UI", FS(14.f), FontStyleRegular, UnitPixel);
+    Font fs(L"Microsoft YaHei UI", FS(12.f), FontStyleRegular, UnitPixel);
+    Font fv(L"Microsoft YaHei UI", FS(15.f), FontStyleBold, UnitPixel);
+
     StringFormat lft;
     lft.SetLineAlignment(StringAlignmentCenter);
     lft.SetFormatFlags(StringFormatFlagsNoWrap);
@@ -2575,13 +2946,10 @@ static void DrawCalibPage(Graphics& g, int W, int H) {
     StringFormat rgt;
     rgt.SetAlignment(StringAlignmentFar);
     rgt.SetLineAlignment(StringAlignmentCenter);
-
-    g.DrawString(tr(S_BACK), -1, &fs, PointF(28, 18), &sb);
-    g.DrawString(tr(S_OFFPG), -1, &ft, RectF(0, 46, (float)W, 32), &cen, &tb);
-    g.DrawString(tr(S_OFFHINT), -1, &fs, RectF(0, 80, (float)W, 16), &cen, &sb);
-
-    Pen sep(g_pal.pillEdge, 1.f);
-    g.DrawLine(&sep, SET_L, 102.f, SET_R, 102.f);
+    StringFormat cen;
+    cen.SetAlignment(StringAlignmentCenter);
+    cen.SetLineAlignment(StringAlignmentCenter);
+    Pen border(g_pal.pillEdge, 1.f);
 
     for (int i = 0; i < (int)g_mons.size(); ++i) {
         float y = CalRowY(i);
@@ -2624,7 +2992,7 @@ static void HidePanel() {
     }
     DestroyWindow(g_hwnd);
     g_hwnd = nullptr;
-    g_moved = false;                     // 下次打开回到右下角默认位置
+    // g_moved 保留：面板位置跨开关记忆（PanelX/PanelY），下次打开仍在原处
 }
 
 // 按下时的命中判定：环带 ±20 px，底部 60° 为死区
@@ -2737,8 +3105,8 @@ static void DrawMonitorMenu(Graphics& g, int W, int H) {
 
     SolidBrush tb(g_pal.text);
     SolidBrush sb(g_pal.sub);
-    Font fi(L"Microsoft YaHei UI", 13, FontStyleRegular, UnitPixel);
-    Font fb(L"Microsoft YaHei UI", 13, FontStyleBold, UnitPixel);
+    Font fi(L"Microsoft YaHei UI", FS(13.f), FontStyleRegular, UnitPixel);
+    Font fb(L"Microsoft YaHei UI", FS(13.f), FontStyleBold, UnitPixel);
 
     StringFormat lf;
     lf.SetLineAlignment(StringAlignmentCenter);
@@ -2831,14 +3199,17 @@ static void OnQuickAction(int idx) {
     } else if (idx == 2) {
         g_cfgAuto = g_cfgAuto ? 0 : 1;
         RegPut(L"AutoBrightness", g_cfgAuto);
+        TouchPageCache();                        // 设置页里的自动开关状态跟着变
         if (g_cfgAuto) ApplyAutoBrightness();
+        else g_autoEngaged = false;             // 关闭不打断进行中的过渡，让它滑完；仅停止后续调度
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
     } else if (idx == 3) {
         g_dragging = false;
         g_menuOpen = false;
         if (GetCapture() == g_hwnd) ReleaseCapture();
         g_page = 1;
-        PlacePanel();                        // 设置页更高：按新页高重新定位并重建圆角
+        g_subScroll = 0;
+        PlacePanel();                        // 页高已固定，仅按记忆位置定位
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
     } else if (idx == 4) {
         TurnOffSelectedScreen();             // 关闭选中屏幕（DDC 0xD6 熄屏，任意输入后恢复）
@@ -2875,7 +3246,23 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TrackMouseEvent(&tme);
         float s = g_dpi / 96.0f * UI_SCALE;
         int x = (int)(GET_X_LPARAM(lp) / s), y = (int)(GET_Y_LPARAM(lp) / s);
-        if (g_page >= 1) return 0;           // 设置页/校准页不响应 hover 与轨道交互
+        if (g_scrollDrag && g_page >= 1) {   // 滚动条拖动：thumb 跟随（capture 期间移出窗口也更新）
+            int contentEnd = (g_page == 1) ? SettingsPageH() - 56
+                                           : 160 + (int)g_mons.size() * 52;
+            g_subScroll = g_scrollTo = ScrollFromDragY(y, contentEnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        if (g_page == 2) return 0;           // 校准页不响应 hover 与轨道交互
+        if (g_page == 1) {                   // 设置页：只做分组标题悬停高亮
+            int hh = -1;
+            int sy = y + g_subScroll;
+            RefreshSetLayout();
+            for (int gi = 0; gi < 4; ++gi)
+                if (InRect(SetHeaderRect(gi), x, sy)) { hh = gi; break; }
+            if (hh != g_setHeaderHover) { g_setHeaderHover = hh; InvalidateRect(hwnd, nullptr, FALSE); }
+            return 0;
+        }
         if (g_menuOpen) {
             int hv = MenuHit(x, y, PANEL_H);
             if (hv != g_menuHover) { g_menuHover = hv; InvalidateRect(hwnd, nullptr, FALSE); }
@@ -2888,6 +3275,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSELEAVE:
         if (g_hover != -1) { g_hover = -1; InvalidateRect(hwnd, nullptr, FALSE); }
+        if (g_setHeaderHover != -1) { g_setHeaderHover = -1; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
 
     case WM_LBUTTONDOWN: {
@@ -2900,6 +3288,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_menuHover = -1;
             if (hit == MENU_HIT_CALIB) {
                 g_page = 2;                  // 进入单屏偏移校准页
+                g_subScroll = 0;
                 PlacePanel();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -2909,17 +3298,33 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        if (g_page >= 1 && x >= PANEL_W - 14 && SubScrollMax() > 0) {   // 滚动条：点按/拖动 thumb 直接跳转（与控件区不重叠）
+            int contentEnd = (g_page == 1) ? SettingsPageH() - 56
+                                           : 160 + (int)g_mons.size() * 52;
+            int ny = ScrollFromDragY(y, contentEnd);
+            SetCapture(hwnd);
+            g_scrollDrag = true;
+            g_scrollAnim = false;
+            if (g_msg) KillTimer(g_msg, 8);
+            g_scrollTo = g_subScroll = ny;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
         if (g_page == 2) {
             SetFocus(hwnd);
+            TouchPageCache();                    // 校准点击（±/归零）改内容
             if (InRect(SetBackRect(), x, y)) {
                 g_page = 0;
+                g_subScroll = 0;
                 PlacePanel();                // 回主面板
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             for (int i = 0; i < (int)g_mons.size(); ++i) {
-                bool minus = InRect(CalMinusRect(i), x, y);
-                bool plus  = InRect(CalPlusRect(i), x, y);
+                int sy = y + g_subScroll;
+                bool minus = InRect(CalMinusRect(i), x, sy);
+                bool plus  = InRect(CalPlusRect(i), x, sy);
                 if (!minus && !plus) continue;
                 g_mons[i].off = std::max(-25, std::min(25, g_mons[i].off + (plus ? 1 : -1)));
                 RegPut((L"Off_" + g_mons[i].key).c_str(), g_mons[i].off);
@@ -2927,7 +3332,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (InRect(CalResetRect(), x, y)) {
+            if (InRect(CalResetRect(), x, y + g_subScroll)) {
                 for (auto& m : g_mons) { m.off = 0; RegPut((L"Off_" + m.key).c_str(), 0); }
                 if (g_sel == -1) Post(g_val);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -2938,50 +3343,50 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (g_page == 1) {
             SetFocus(hwnd);
+            TouchPageCache();                    // 任何设置点击都可能改内容（开关/数值/录制态）
             if (InRect(SetBackRect(), x, y)) {
                 StopCapture();
                 g_menuOpen = false;
                 g_page = 0;
-                PlacePanel();                // 回主面板：恢复 570 高度
+                g_subScroll = 0;
+                g_setHeaderHover = -1;
+                PlacePanel();                // 回主面板
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (InRect(SetToggleRect(0), x, y)) {
-                g_cfgStart = g_cfgStart ? 0 : 1;
-                ApplyAutostart(g_cfgStart != 0);
-                RegPut(L"Autostart", g_cfgStart);
+            RefreshSetLayout();
+            int sy = y + g_subScroll;    // 内容坐标：随页内滚动平移（返回按钮/状态行固定，用原 y）
+            for (int gi = 0; gi < 4; ++gi) {
+                if (!InRect(SetHeaderRect(gi), x, sy)) continue;
+                g_setFold ^= (1 << gi);      // 折叠/展开分组，状态记忆（页高固定，无需改窗口）
+                RegPut(L"SetFold", g_setFold);
+                g_setHeaderHover = -1;
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (InRect(SetToggleRect(1), x, y)) {
-                g_cfgAuto = g_cfgAuto ? 0 : 1;
-                RegPut(L"AutoBrightness", g_cfgAuto);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (InRect(SetMouseToggleRect(0), x, y)) {
-                g_wheelTray = g_wheelTray ? 0 : 1;
-                RegPut(L"WheelTray", g_wheelTray);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (InRect(SetMouseToggleRect(1), x, y)) {
-                g_wheelPanel = g_wheelPanel ? 0 : 1;
-                RegPut(L"WheelPanel", g_wheelPanel);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (InRect(SetMouseToggleRect(2), x, y)) {
-                g_keyBright = g_keyBright ? 0 : 1;
-                RegPut(L"KeyBright", g_keyBright);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            for (int i = 2; i <= 3; ++i) {
-                bool tminus = InRect(SetTimeMinusRect(i), x, y);
-                bool tplus  = InRect(SetTimePlusRect(i), x, y);
-                bool pminus = InRect(SetPctMinusRect(i), x, y);
-                bool pplus  = InRect(SetPctPlusRect(i), x, y);
+            // 折叠组的行控件不可见，命中也必须一并失效：否则折叠后下移的其他组
+            // （如快捷键的「修改」）会撞上折叠组残留在原坐标的隐形开关/按钮
+            if (g_setFold & 1) {                 // 通用
+                if (InRect(SetToggleRect(0), x, sy)) {
+                    g_cfgStart = g_cfgStart ? 0 : 1;
+                    ApplyAutostart(g_cfgStart != 0);
+                    RegPut(L"Autostart", g_cfgStart);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetToggleRect(1), x, sy)) {
+                    g_cfgAuto = g_cfgAuto ? 0 : 1;
+                    RegPut(L"AutoBrightness", g_cfgAuto);
+                    if (g_cfgAuto) ApplyAutoBrightness();       // 与快捷按钮一致：打开立即生效（5 秒过渡）
+                    else g_autoEngaged = false;                 // 关闭不打断进行中的过渡
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                for (int i = 2; i <= 3; ++i) {
+                bool tminus = InRect(SetTimeMinusRect(i), x, sy);
+                bool tplus  = InRect(SetTimePlusRect(i), x, sy);
+                bool pminus = InRect(SetPctMinusRect(i), x, sy);
+                bool pplus  = InRect(SetPctPlusRect(i), x, sy);
                 if (!tminus && !tplus && !pminus && !pplus) continue;
                 if (tminus || tplus) {
                     if (i == 2) {
@@ -3003,28 +3408,91 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (InRect(SetDdcMinus(), x, y) || InRect(SetDdcPlus(), x, y)) {
-                bool plus = InRect(SetDdcPlus(), x, y);
-                g_cfgDelay = plus ? std::min(200, g_cfgDelay + 5)
-                                  : std::max(10, g_cfgDelay - 5);
-                RegPut(L"DdcDelay", g_cfgDelay);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
+                if (InRect(SetDdcMinus(), x, sy) || InRect(SetDdcPlus(), x, sy)) {
+                    bool plus = InRect(SetDdcPlus(), x, sy);
+                    g_cfgDelay = plus ? std::min(200, g_cfgDelay + 5)
+                                      : std::max(10, g_cfgDelay - 5);
+                    RegPut(L"DdcDelay", g_cfgDelay);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetStepMinus(), x, sy) || InRect(SetStepPlus(), x, sy)) {
+                    static const int steps[4] = { 1, 2, 5, 10 };
+                    int i = 0;
+                    while (i < 3 && steps[i] != g_step) ++i;
+                    i = InRect(SetStepPlus(), x, sy) ? std::min(3, i + 1) : std::max(0, i - 1);
+                    g_step = steps[i];
+                    RegPut(L"Step", g_step);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetLangRect(), x, sy)) {          // 语言整行：循环 跟随系统/中文/English
+                    g_langPref = (g_langPref + 1) % 3;
+                    RegPut(L"Lang", g_langPref);
+                    ApplyLang();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetFontMinusRect(), x, sy) || InRect(SetFontPlusRect(), x, sy)) {
+                    bool fplus = InRect(SetFontPlusRect(), x, sy);
+                    g_fontPct = fplus ? std::min(110, g_fontPct + 10)   // 120% 时标签会压到数值，上限 110
+                                      : std::max(90, g_fontPct - 10);
+                    RegPut(L"FontPct", g_fontPct);
+                    g_fontScale = g_fontPct / 100.0f;
+                    TouchPageCache();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetToggleRect(7), x, sy)) {       // 软件调光（自托盘迁入）
+                    DoGammaToggle();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetCalWLRect(), x, sy)) {         // 标定 HDR 基准亮度（自托盘迁入）
+                    DoCalWL();
+                    return 0;
+                }
+            }                                    // 通用组折叠时以上全部失效
+            if (g_setFold & 4) {                 // 鼠标与键盘
+                if (InRect(SetCalWheelRect(), x, sy)) {  // 校准滚轮图标位置（自托盘迁入）
+                    DoCalWheel();
+                    return 0;
+                }
+                if (InRect(SetMouseToggleRect(0), x, sy)) {
+                    g_wheelTray = g_wheelTray ? 0 : 1;
+                    RegPut(L"WheelTray", g_wheelTray);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetMouseToggleRect(1), x, sy)) {
+                    g_wheelPanel = g_wheelPanel ? 0 : 1;
+                    RegPut(L"WheelPanel", g_wheelPanel);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (InRect(SetMouseToggleRect(2), x, sy)) {
+                    g_keyBright = g_keyBright ? 0 : 1;
+                    RegPut(L"KeyBright", g_keyBright);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
             }
-            if (InRect(SetStepMinus(), x, y) || InRect(SetStepPlus(), x, y)) {
-                static const int steps[4] = { 1, 2, 5, 10 };
-                int i = 0;
-                while (i < 3 && steps[i] != g_step) ++i;
-                i = InRect(SetStepPlus(), x, y) ? std::min(3, i + 1) : std::max(0, i - 1);
-                g_step = steps[i];
-                RegPut(L"Step", g_step);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
+            if (g_setFold & 2) {                 // 全局快捷键
+                for (int i = 0; i < 3; ++i) {
+                    if (InRect(SetEditRect(i), x, sy)) {
+                        if (g_capSlot == i + 1) StopCapture();
+                        else StartCapture(i + 1);
+                        return 0;
+                    }
+                }
             }
-            for (int i = 0; i < 3; ++i) {
-                if (InRect(SetEditRect(i), x, y)) {
-                    if (g_capSlot == i + 1) StopCapture();
-                    else StartCapture(i + 1);
+            if (g_setFold & 8) {                 // 关于
+                if (InRect(SetDiagRect(), x, sy)) {      // 复制诊断信息（自托盘迁入）
+                    CopyDiagnostics();
+                    return 0;
+                }
+                if (InRect(SetHomeRect(), x, sy)) {
+                    ShellExecuteW(nullptr, L"open", L"https://github.com/iosvcnm/lumen", nullptr, nullptr, SW_SHOWNOACTIVATE);
                     return 0;
                 }
             }
@@ -3049,11 +3517,27 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP:
+        if (g_scrollDrag) { g_scrollDrag = false; ReleaseCapture(); return 0; }
         if (g_dragging) { g_dragging = false; ReleaseCapture(); }
         return 0;
 
+    case WM_CAPTURECHANGED:
+        g_scrollDrag = false;                // capture 被系统收回（如切页/失焦）时结束拖动
+        return 0;
+
     case WM_MOUSEWHEEL: {
-        if (g_page >= 1 || g_capSlot || g_menuOpen || !g_wheelPanel) return 0;
+        if (g_page >= 1) {                   // 子页：滚轮滚动页内内容，每档 ±52 逻辑 px（缓动到位）
+            if (!g_scrollDrag) {
+                int d = GET_WHEEL_DELTA_WPARAM(wp);
+                if (d) {
+                    int notches = d / WHEEL_DELTA;
+                    if (!notches) notches = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）也走一行
+                    ScrollTo(g_subScroll - notches * 52);
+                }
+            }
+            return 0;
+        }
+        if (g_capSlot || g_menuOpen || !g_wheelPanel) return 0;
         int d = GET_WHEEL_DELTA_WPARAM(wp);
         int steps = (d / WHEEL_DELTA) * g_step;
         if (!steps) steps = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）
@@ -3062,6 +3546,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:   // Alt 按住时字母键产生 SYSKEYDOWN：与 KEYDOWN 同路处理，否则 Alt 组合录不进
         if (g_capSlot) {
             if (wp == VK_ESCAPE) { StopCapture(); return 0; }
             if (wp == VK_CONTROL || wp == VK_MENU || wp == VK_SHIFT ||
@@ -3090,6 +3575,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (g_page >= 1) {
                 g_page = 0;                  // 设置页/校准页：Esc 回主面板
+                g_subScroll = 0;
                 PlacePanel();
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else {
@@ -3111,9 +3597,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_EXITSIZEMOVE: {
         RECT r{};
-        if (GetWindowRect(hwnd, &r)) {   // 用户拖动结束：记住位置，切页沿用
+        if (GetWindowRect(hwnd, &r)) {   // 用户拖动结束：记住位置，切页与下次打开沿用
             g_moved = true;
             g_movedPos = POINT{ r.left, r.top };
+            RegPut(L"PanelX", (DWORD)r.left);
+            RegPut(L"PanelY", (DWORD)r.top);
         }
         return 0;
     }
@@ -3128,6 +3616,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DPICHANGED: {
         g_dpi = HIWORD(wp);
+        TouchPageCache();
         RECT* r = (RECT*)lp;
         SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
@@ -3256,6 +3745,7 @@ static void ShowPanel() {
         if (!g_namesDone) { g_namesDone = true; RefreshNamesAsync(); }
         MatchSavedSelection();
         g_page = g_wantSettings ? 1 : 0;
+        g_subScroll = 0;
         g_wantSettings = false;
         if (g_sel >= 0) {
             g_val = g_mons[g_sel].pct;
@@ -3284,26 +3774,33 @@ static void TogglePanel() {
 
 static DWORD WINAPI CalWLThread(LPVOID);
 
+// 托盘菜单迁入设置页的功能（设置页行点击与托盘共用同一实现）
+static void DoCalWL() {
+    CreateThread(nullptr, 0, CalWLThread, nullptr, 0, nullptr);   // 6 秒采样，气泡报结果
+}
+static void DoCalWheel() {
+    g_calibrating = true;
+    wchar_t info[96];
+    swprintf(info, 96, tr(S_CALIBHINT));
+    g_nid.uFlags |= NIF_INFO;
+    wcsncpy(g_nid.szInfo, info, 255); g_nid.szInfo[255] = 0;
+    wcsncpy(g_nid.szInfoTitle, L"lumen", 63); g_nid.szInfoTitle[63] = 0;
+    g_nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_nid.uFlags &= ~NIF_INFO;
+}
+static void DoGammaToggle() {
+    g_gammaDim = g_gammaDim ? 0 : 1;
+    RegPut(L"GammaDim", g_gammaDim);
+    if (!g_gammaDim) { ResetGammaAll(); OverlayCloseAll(); }   // 关闭即恢复
+    else Post(g_val);                        // 开启立即按当前亮度应用
+}
+
 static void ShowMenu() {
     POINT pt;
     GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, tr(S_SHOWPANEL));
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, 2, tr(S_BRIGHTUP));
-    AppendMenuW(m, MF_STRING, 3, tr(S_BRIGHTDN));
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    HMENU lm = CreatePopupMenu();
-    int cur = RegGet(L"Lang", 0);
-    AppendMenuW(lm, MF_STRING | (cur == 0 ? MF_CHECKED : 0), 10, tr(S_AUTO));
-    AppendMenuW(lm, MF_STRING | (cur == 1 ? MF_CHECKED : 0), 11, L"中文");
-    AppendMenuW(lm, MF_STRING | (cur == 2 ? MF_CHECKED : 0), 12, L"English");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)lm, tr(S_LANG));
-    AppendMenuW(m, MF_STRING, 6, tr(S_DIAG));
-    AppendMenuW(m, MF_STRING | (g_gammaDim ? MF_CHECKED : 0), 7, tr(S_GAMMA));
-    AppendMenuW(m, MF_STRING, 8, tr(S_CAL));
-    AppendMenuW(m, MF_STRING, 9, tr(S_CALIB));
-
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 5, tr(S_SETTINGS));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -3313,36 +3810,10 @@ static void ShowMenu() {
     DestroyMenu(m);
 
     if (cmd == 1) ShowPanel();
-    else if (cmd == 2) { Adjust(10); ShowOsd(); }
-    else if (cmd == 3) { Adjust(-10); ShowOsd(); }
-    else if (cmd == 6) CopyDiagnostics();
-    else if (cmd == 8) {
-        CreateThread(nullptr, 0, CalWLThread, nullptr, 0, nullptr);   // 6 秒采样，气泡报结果
-    }
-    else if (cmd == 9) {
-        g_calibrating = true;
-        wchar_t info[96];
-        swprintf(info, 96, tr(S_CALIBHINT));
-        g_nid.uFlags |= NIF_INFO;
-        wcsncpy(g_nid.szInfo, info, 255); g_nid.szInfo[255] = 0;
-        wcsncpy(g_nid.szInfoTitle, L"lumen", 63); g_nid.szInfoTitle[63] = 0;
-        g_nid.dwInfoFlags = NIIF_INFO;
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-        g_nid.uFlags &= ~NIF_INFO;
-    }
-    else if (cmd == 7) {
-        g_gammaDim = g_gammaDim ? 0 : 1;
-        RegPut(L"GammaDim", g_gammaDim);
-        if (!g_gammaDim) { ResetGammaAll(); OverlayCloseAll(); }   // 关闭即恢复
-        else Post(g_val);                        // 开启立即按当前亮度应用
-    }
-    else if (cmd == 10 || cmd == 11 || cmd == 12) {
-        RegPut(L"Lang", cmd - 10);
-        ApplyLang();
-    }
     else if (cmd == 5) {
         ShowPanel();
         g_page = 1;
+        g_subScroll = 0;
         PlacePanel();
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
     }
@@ -3536,8 +4007,30 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD ev, HWND hwnd, LONG, LONG
         HidePanel();
 }
 
+static void RampPost(int pct) {       // 过渡自身的写入：经 Post 记账但不取消过渡
+    g_rampPost = true;
+    Post(pct);
+    g_rampPost = false;
+}
+
+static void AutoRampTick() {
+    if (!g_autoRamp || g_screenOff) { AutoRampStop(); return; }   // 关闭开关不打断过渡，滑完为止；熄屏仍终止
+    ++g_autoTick;
+    if (g_autoTick >= AUTO_RAMP_TICKS) { AutoRampStop(); Post(g_autoTo); return; }
+    int v = (int)lround(g_autoFrom + (g_autoTo - g_autoFrom) * (double)g_autoTick / AUTO_RAMP_TICKS);
+    if (v != g_val) RampPost(v);
+}
+
+static void StartAutoRamp(int from, int to) {
+    g_autoFrom = from;
+    g_autoTo   = to;
+    g_autoTick = 0;
+    g_autoRamp = true;
+    SetTimer(g_msg, 7, AUTO_RAMP_TIMER_MS, nullptr);
+}
+
 static void ApplyAutoBrightness() {
-    if (!g_cfgAuto || g_screenOff) return;   // 熄屏期间不写亮度，避免覆盖恢复快照与 Last_ 记忆
+    if (!g_cfgAuto || g_screenOff) { g_autoEngaged = false; return; }   // 熄屏期间不写亮度，避免覆盖恢复快照与 Last_ 记忆
     SYSTEMTIME st{};
     GetLocalTime(&st);
     double h = st.wHour + st.wMinute / 60.0;
@@ -3551,7 +4044,16 @@ static void ApplyAutoBrightness() {
     else if (h < s1)        pct = day;                                        // 白天保持
     else if (h < s1 + ramp) pct = day + (night - day) * (h - s1) / ramp;      // 到结束时间：降到夜间亮度
     else                    pct = night;                                      // 夜间保持
-    Post((int)lround(pct));
+    int target = (int)lround(pct);
+    if (!g_autoEngaged) {                     // 刚打开（0→1）：从当前亮度 5 秒滑到目标，不跳变
+        g_autoEngaged = true;
+        if (g_autoRamp) return;
+        int cur = g_val;
+        if (target != cur && abs(target - cur) >= 2) { StartAutoRamp(cur, target); return; }
+    } else if (g_autoRamp) {
+        return;                               // 过渡进行中：60s 定时器不插手，每 tick 收敛到目标
+    }
+    Post(target);
 }
 
 static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3671,6 +4173,8 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp == 2) ApplyAutoBrightness();
+        if (wp == 7) AutoRampTick();
+        if (wp == 8) ScrollAnimTick();
         if (wp == 4 && RefreshHdrFlags(g_mons) && g_hwnd)
             InvalidateRect(g_hwnd, nullptr, FALSE);   // HDR 开/关 → 徽章自动出现/消失
         return 0;
@@ -3696,6 +4200,10 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         free(tag);
         return 0;
     }
+
+    case NIN_BALLOONUSERCLICK:            // 更新气泡被点击 → 打开下载页（气泡里链接原本只是纯文本）
+        ShellExecuteW(nullptr, L"open", L"https://github.com/iosvcnm/lumen/releases/latest", nullptr, nullptr, SW_SHOWNOACTIVATE);
+        return 0;
 
     case WM_DISPLAYCHANGE:
     case WM_POWERBROADCAST:
@@ -3757,10 +4265,36 @@ static void RegisterClasses() {
         if (m == WM_PAINT) { OnOsdPaint(h); return 0; }
         if (m == WM_ERASEBKGND) return 1;
         if (m == WM_TIMER) { ShowWindow(h, SW_HIDE); KillTimer(h, 1); return 0; }
+        if (m == WM_LBUTTONDOWN) {            // 拖动浮窗：按住即可挪位置，期间暂停 1.4s 自动隐藏
+            KillTimer(h, 1);
+            g_osdDrag = true;
+            g_osdAnchor = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            SetCapture(h);
+            return 0;
+        }
+        if (m == WM_MOUSEMOVE && g_osdDrag) {
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            ClientToScreen(h, &pt);
+            SetWindowPos(h, nullptr, pt.x - g_osdAnchor.x, pt.y - g_osdAnchor.y, 0, 0,
+                         SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE);
+            return 0;
+        }
+        if (m == WM_LBUTTONUP && g_osdDrag) { // 释放：记录位置并恢复自动隐藏
+            g_osdDrag = false;
+            ReleaseCapture();
+            RECT rc;
+            GetWindowRect(h, &rc);
+            g_osdPos = { rc.left, rc.top };
+            RegPut(L"OsdX", (DWORD)rc.left);
+            RegPut(L"OsdY", (DWORD)rc.top);
+            SetTimer(h, 1, 1400, nullptr);
+            return 0;
+        }
+        if (m == WM_CAPTURECHANGED) { g_osdDrag = false; return 0; }
         return DefWindowProcW(h, m, w, l);
     };
     c.lpszClassName = kOsdClass;
-    c.hCursor = nullptr;
+    c.hCursor = LoadCursorW(nullptr, IDC_SIZEALL);   // 可拖动暗示
     RegisterClassExW(&c);
 }
 
