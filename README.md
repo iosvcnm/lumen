@@ -5,8 +5,8 @@
 **English**: Native Windows brightness control over a hybrid DDC/CI + WMI path, with a gamma-based software dimming fallback for HDR monitors. Single-file Win32 + GDI+ app (~490 KB) — portable, no runtime dependencies, fully vector-drawn UI.
 
 <p align="center">
-  <img src="assets/panel.png" width="430" alt="lumen 主面板（浅色 / 深色主题）">
-  <img src="assets/settings.png" width="215" alt="设置页">
+  <img src="assets/panel.png" width="425" alt="lumen 主面板（浅色 / 深色主题）">
+  <img src="assets/settings.png" width="200" alt="设置页">
 </p>
 
 ## 下载 · Download
