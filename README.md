@@ -1,88 +1,48 @@
 # lumen
 
-原生 Windows 亮度控制。Win32 + GDI+，单个 419 KB 的 exe，无 WebView、无第三方运行时。界面全部由 GDI+ 矢量路径运行时绘制。
+原生 Windows 亮度控制。DDC/CI + WMI 混合通路，HDR 显示器可用软件调光兜底；Win32 + GDI+ 单文件实现（约 490 KB），免安装、无运行时依赖、界面全部矢量绘制。
 
-## 下载与使用
+**English**: Native Windows brightness control over a hybrid DDC/CI + WMI path, with a gamma-based software dimming fallback for HDR monitors. Single-file Win32 + GDI+ app (~490 KB) — portable, no runtime dependencies, fully vector-drawn UI.
 
-**直接运行**：到 [Releases](https://github.com/iosvcnm/lumen/releases/latest) 下载 `lumen.exe`，双击即可。单文件、免安装、不写系统目录，适用于 Windows 10 / 11 x64；仓库本身只放源码，不含二进制产物。
+<p align="center">
+  <img src="assets/panel.png" width="430" alt="lumen 主面板（浅色 / 深色主题）">
+  <img src="assets/settings.png" width="215" alt="设置页">
+</p>
 
-1. 启动后只驻留托盘，不弹窗；左键点托盘图标呼出面板，点面板外任意位置或按 `Esc` 收起。
-2. `Ctrl+PageUp` / `Ctrl+PageDown` 全局调节亮度（±5），`Ctrl+Alt+B` 全局呼出/收起面板，右上角短暂显示当前百分比；键位均可在设置页修改。
-3. 顶部胶囊切换单台显示器或「全部显示器」，选择会被记住；底部四个按钮依次是主题切换、按时间自动调节、设置、熄屏。
-4. 外接显示器需在显示器自身的 OSD 菜单里开启 DDC/CI，否则该屏不可调；笔记本内置屏走系统 WMI 通路，无需额外设置。
-5. 托盘右键菜单可直接进设置或退出。配置保存在注册表 `HKCU\Software\lumen`。
+## 下载 · Download
 
-**从源码构建**：见下文「构建」。需要 MSYS2 MinGW-w64 工具链，`build.bat` 不写死任何工具链路径。
+到 [Releases](https://github.com/iosvcnm/lumen/releases/latest) 下载 `lumen.exe`，双击运行（Windows 10 / 11 x64，免安装）。启动后驻留托盘，左键托盘图标呼出面板，滚轮直接调节亮度。
+Download `lumen.exe` from [Releases](https://github.com/iosvcnm/lumen/releases/latest) and run it (Windows 10 / 11 x64, no install needed). It lives in the tray — click the icon to open the panel and scroll to adjust brightness.
 
-## 实测
+## 功能 · Features
 
-| 指标 | 数值 |
-| --- | --- |
-| exe | 419 KB（完全静态链接 MinGW 运行时，双击即可运行，不依赖 MinGW 环境） |
-| 托盘常驻 | 私有内存 3.2 MB，句柄 250（resmon 同尺实测，与 1.2.1 持平，见 `docs/CHANGES-since-1.2.1.md` 第八节） |
-| 开关面板 20 次 | 句柄无增长（窗口创建/销毁循环无泄漏） |
-| 亮度链路 | 热键 → 后台写入 → DDC/CI 实际生效，UI 与硬件读数一致 |
-| 热键录制 | 录制 Ctrl+Alt+F8 后立即重注册并显示新键位，已验证 |
+- 混合亮度通路：外接屏走 DDC/CI，内置屏走 WMI，自动识别、统一调节
+- 「全部显示器」同步 + 单屏偏移校准（多屏观感对齐）
+- HDR 兼容：感知 Windows SDR 白电平，gamma 软件调光兜底（LUT 读回校验、自动降级）
+- 按时间自动调节：日/夜目标亮度，切换时 5 秒平滑过渡
+- 熄屏：DDC `0xD6` 电源命令，固件不支持时自动降级 `SC_MONITORPOWER` —— **MStar 方案显示器请先看下方警告**
+- 调节方式：面板旋钮、托盘/面板滚轮、全局快捷键、键盘亮度键（HID）
+- 设置页：折叠分组 + 页内滚动、中英双语、字体大小 90–110%、软件调光 / 标定 / 校准 / 诊断集中管理
+- 记忆：显示器选择、面板与 OSD 位置、每台屏亮度、分组折叠
+- 一键诊断复制；静默检查更新
 
-## 交互
+## ⚠️ KTC / MStar 显示器熄屏警告
 
-| 项 | 说明 |
-| --- | --- |
-| 启动 | 只建 message-only 窗口 + 托盘 + 热键，不渲染界面 |
-| 打开面板 | 托盘左键 / 托盘菜单 / `--show`，此时才枚举显示器并建窗；`--settings` 可直接进设置页 |
-| 关闭面板 | `Esc`、托盘再点、点击面板外任意位置（`SetWinEventHook` 监听全局前台变化，不依赖本窗口能否收到 `WM_ACTIVATE`）：`DestroyWindow` 真正销毁 |
-| 定位 | 按鼠标所在显示器的 `rcWork`，再按 `ABM_GETTASKBARPOS` 避开任务栏（自动隐藏时也避开），右下角留 11 px 悬浮间距；用户拖动过面板后记住左上角，进入设置页/返回时沿用该位置（只在越出工作区时收回），关闭面板后恢复默认右下角 |
-| 显示器切换 | 胶囊按钮「全部显示器 (N 台) ▾」在面板内展开自绘下拉：圆角卡片 + 描边 + 投影，选项带「（主显示器）/（副屏）/（内置）」，不可调光的屏额外标「· 不可调」，当前项打勾；点菜单外或 `Esc` 收起，不影响面板。**选择会被记住**：按显示器 PnPId 写入注册表 `SelMonitor`，下次打开面板、乃至显示器热插拔后都恢复上次的选择（找不到对应屏则回退到「全部显示器」） |
-| 调节 | 按下时只判定是否落在环带 ±20 px 内；一旦开始拖拽就与半径解耦，只按鼠标与圆心的夹角算值，拖出环外仍继续；底部 60° 死区；点击定位、拖动单次最多变化 5%（阻尼）；滚轮与快捷键按设置页的「步长」调节（1/2/5/10，默认 5） |
-| OSD | 快捷键调节时右上角弹轻量提示框（当前百分比），1.4 秒自动消失，不抢焦点；底色/文字跟随当前主题，带投影与描边，落在亮背景上也有边界 |
-| 昼夜 | 左按钮循环切换三态：跟随系统 → 强制浅/深 → 跟随系统（跟随系统时切到当前观感的反色，强制时一键回「自动」）；托盘图标与面板按钮图标反映当前状态（昼夜组合=自动，太阳/月亮=强制），切换时 OSD 显示「自动 / 浅色 / 深色」 |
-| 托盘滚轮 | 在托盘图标上滚动滚轮直接调节亮度（按「步长」），带 OSD 提示；Raw Input 直达（EarTrumpet 同款，`Shell_NotifyIconGetRect` 命中图标），不依赖 explorer 转发——Win11 对托盘图标（含固定图标）已不转发 `WM_MOUSEWHEEL`，此通路在新系统仍可用；可在设置页「鼠标设置」关闭（注册表 `WheelTray`） |
-| 面板滚轮 | 面板打开时（主面板页）滚动滚轮直接调节亮度（按「步长」）；可在设置页「鼠标设置」关闭（注册表 `WheelPanel`） |
-| 亮度记忆 | 每台屏按稳定标识把最后亮度写入注册表，开机启动、睡眠唤醒（`WM_POWERBROADCAST`）、显示器变化（`WM_DISPLAYCHANGE`）时自动恢复 |
-| 语言 | 托盘菜单「语言」子菜单：自动（跟随系统 UI 语言）/ 中文 / English，即选即生效 |
-| 检查更新 | 启动 8 秒后后台静默查询 GitHub Releases（仅 https + api.github.com 白名单 + 公网 IP 校验），有新版弹一次托盘气泡带下载链接 |
-| 一键诊断 | 托盘菜单「复制诊断信息」或命令行 `lumen.exe --diag`：版本、配置、三条快捷键、每台屏的名称/设备路径/可控性/当前亮度，进剪贴板 |
-| 自动 | 中按钮开关「按时间自动调节」：到「开始时间」后 8 分钟内从当前亮度渐变到「日间亮度」，到「结束时间」后 8 分钟内渐变到「夜间亮度」，其余时间保持；每分钟刷新一次，开关打开立即生效 |
-| 设置 | 右按钮（或托盘菜单「设置」）切到面板内的设置页：开机自启、按时间自动调节、起止时间与日间/夜间目标亮度双列（时间 ±1 小时、亮度 ±5%）、DDC/CI 指令间隔（10–200 ms）与调节步长（1/2/5/10）同行左右分布、三条快捷键录制（上调 / 下调 / 呼出面板）、鼠标与键盘（托盘图标 / 面板打开时的滚轮开关 + 键盘亮度键开关）；设置页比主面板高（400×750，底部锚点不变），返回主面板恢复 570；绘制与命中判定共用同一组矩形常量；设置页内不响应滚轮与轨道拖动；左上「← 返回」回主面板 |
-| 键盘亮度键 | 带标准亮度键的键盘可直接调节（HID Consumer `0x006F` / `0x0070`，Raw Input 监听，不占系统按键、不影响其他媒体键）；设置页「鼠标与键盘」组开启（默认关）。注意按亮度键时 Windows 会同时弹出它自己的亮度提示（只反映 Windows 内部数值，不写外接屏 DDC），与 lumen 的 OSD 并存且数值可能不一致；把步长设为 10 可让两边显示大体对齐 |
-| 熄屏 | 第四个按钮「电源」关闭当前选中屏：外接屏先试 DDC/CI `VCP 0xD6=4`（软关）再试 `5`（硬关），写入后读回确认，固件忽略时降级为系统广播 `SC_MONITORPOWER`；熄屏前记录每台屏亮度，前 3 秒为防误触宽限期（忽略任何键鼠输入），之后一有输入即点亮（`0xD6=1`，部分固件需二次点亮）并回放原亮度 |
-| HDR 调光 | 软件调光开启时按 10% 分两段：`pct ≥ 10%` 只走 gamma LUT（在原始 LUT 上乘系数、保留校色曲线），遮罩完全透明；`pct < 10%` 把 gamma 锁死在 10% 的基准值，遮罩 alpha 从 0 线性加深到 0.94（透光 6%），两段在 10% 处亮度连续。每次写 LUT 都读回校验，连续两次不符即判定该环境不生效，自动改为全区间遮罩 |
-| 单屏偏移 | 显示器下拉菜单底部「单屏偏移…」进校准页：逐屏 ±25 微调（注册表 `Off_<PnPId>` 持久化，「全部归零」一键复位）；只在「全部显示器」同步时叠加，单屏直接调节不受影响；默认全 0，行为与关闭时完全一致。用于不同面板背光响应不一致时的多屏观感对齐 |
-| 失败反馈 | DDC/CI 写入失败时面板底部显示「写入失败：检查 DDC/CI」 |
+lumen 的「熄屏」按钮通过 DDC/CI `VCP 0xD6` 电源命令关闭显示器。**MStar 方案的显示器（KTC 全系，同方案机型如小米曲面 34" 等）存在已知固件缺陷：`0xD6` 电源命令可能把 OSD 永久写坏**——症状为按菜单键黑屏约 2 秒后画面恢复、但 OSD 菜单不再显示；断电重启、恢复出厂、`D6 05`、`VCP 04` 均无法清除该标志位（参见 supermar1010 的逆向分析与复现记录；KTC H27T22 进工程模式可见 MST9804 主控）。
+
+**English**: The screen-off button turns the monitor off via the DDC/CI `VCP 0xD6` power command. Monitors with MStar scalers (all KTC models, the Xiaomi curved 34" and similar) have a known firmware defect: `0xD6` can permanently corrupt the OSD — pressing Menu blanks the picture for ~2 s, the image comes back, but the OSD menu never shows again. A power cycle, factory reset, `D6 05` or `VCP 04` do **not** clear that flag (see supermar1010's reverse-engineering notes; KTC H27T22 engineering mode reveals an MST9804 scaler).
+
+不确定显示器方案时，请谨慎使用熄屏按钮；临时关屏可用系统自带的显示器休眠代替。
+If you are unsure about your monitor's scaler, use the screen-off button with caution — prefer the system's own display sleep instead.
 
 ## 快捷键
 
 | 组合 | 作用 |
 | --- | --- |
-| `Ctrl+PageUp` / `Ctrl+PageDown` | 亮度 ±5（默认值，可在设置里改） |
-| `Ctrl+Alt+B` | 呼出亮度面板（面板已开时再按收起；默认值，可在设置里改） |
+| `Ctrl+PageUp` / `Ctrl+PageDown` | 亮度 ±5（默认，可在设置页录制修改） |
+| `Ctrl+Alt+B` | 呼出 / 收起面板（默认，可改） |
 
-全局热键共三组。若某组合在启动时已被其他程序占用，托盘会弹气泡提示，在设置页为它录制一个空闲组合即可。
-
-重复双击 `lumen.exe` 不会出现第二个实例，而是唤出已运行实例的面板。
-
-改键规则：组合**必须包含 `Ctrl` 或 `Alt`**（可再叠加 Shift / Win，例如 `Ctrl+Shift+K`）。只有 Shift、或什么都不按的组合会被拒绝并给出红字提示，避免录制结果和系统里大量单键、纯 Shift 组合冲突。
-
-录制方式：设置页点「修改」，直接按下新组合。捕获走两条路径——低级键盘钩子（只观察、不吞键，焦点不在本程序时也能收到）与面板自身的 `WM_KEYDOWN`；命中后延迟 220 ms 再 `RegisterHotKey`，避免手还按着时立刻触发一次亮度调节。组合被占用时保留原键并提示。
-
-## UI
-
-界面是一张竖向卡片：品牌字、刻度环、大旋钮、百分比、显示器胶囊、四个快捷按钮。全部由 GDI+ 矢量路径运行时绘制：
-
-- 卡片：对角渐变 + 34 px 圆角 + 1 px 描边；面板是分层窗口（`UpdateLayeredWindow`，PARGB 缓冲整窗呈现），34 px 圆角边缘走 alpha 渐变、天然抗锯齿，不再用 `SetWindowRgn` 裁剪（region 无抗锯齿，四角有锯齿）。OSD 仍走 `SetLayeredWindowAttributes` + region（尺寸小、锯齿不可见）
-- 环形轨道：300° 弧、13 px 粗，外阴影 + 基色 + 内侧高光三层叠加，呈现嵌入槽位感；底部留 60° 开口
-- 进度弧：深蓝/石墨（深色主题为暖金），从轨道起点顺时针填充到当前亮度，终点带高亮圆点与白色描边
-- 外圈刻度：60 个细点沿同一 300° 弧分布，已覆盖部分着色
-- 旋钮：外盘 + 径向渐变主体（`PathGradientBrush` 模拟内阴影）
-- 太阳：实心圆 + 8 条圆头射线；月牙：两圆差集（`Region::Exclude`）+ 四角星
-- 胶囊：圆角矩形 + 自绘下拉箭头
-- 快捷按钮：椭圆渐变 + 阴影 + 矢量图标（昼夜、A、齿轮、电源）
-- 显示器下拉：面板内自绘（`DrawMonitorMenu`），行高 36 px、22 px 圆角、三层投影，悬停高亮与勾选都取调色板；不再调用系统 `TrackPopupMenu`
-- 设置页：与主面板同一个窗口、同一张卡片、同一套渐变/34 px 圆角/1 px 描边，标题居中与品牌字对齐；行高 52 px，控件统一右对齐到 364 px；快捷键是两个带描边的胶囊 + 右侧「修改/取消」
-
-没有 SVG 解析器、没有图标字体文件、不加载 UI 位图。exe 图标由同一套矢量代码离线烘焙成 ICO（256/48/32/16）。
-
-所有颜色只有一个来源：`Pal` 调色板（深/浅两套）。卡片描边、胶囊与其悬停态、名称气泡、显示器下拉、设置页、错误提示、OSD 全部取调色板字段（`border` / `pillHover` / `menuBg` / `menuHover` / `danger` / `osdBg` / `osdText` / `osdSub`），没有散落的 `Color(255, …)` 字面量，切换主题不会出现某块颜色不跟随。
+组合必须包含 `Ctrl` 或 `Alt`；在设置页点「修改」直接录制，组合被占用时保留原键并提示。
 
 ## 构建
 
@@ -90,91 +50,32 @@
 build.bat
 ```
 
-脚本按需生成 `lumen.ico` → `windres` 编译 `lumen.rc` → 链接 `src\lumen.cpp` 与资源。可选签名：设置环境变量 `SIGN_PFX`（证书路径）与 `SIGN_PFX_PASS`（密码）后运行，构建成功即自动调 `signtool sign /fd SHA256` 签名 exe。等价命令：
-
-```bash
-g++ -std=c++17 -O2 -municode -mwindows -Wall -Wextra \
-  -o lumen.exe src/lumen.cpp lumen_res.o \
-  -lgdiplus -ldxva2 -lshell32 -luser32 -lgdi32 -ladvapi32 \
-  -static -static-libgcc -static-libstdc++ -s
-```
-
-工具链：MSYS2 MinGW-w64。构建前把含 `g++`、`windres` 的 `bin` 目录加入 `PATH` 即可，脚本本身不写死任何路径。
-
-## 显示器名称
-
-- 名称来自 WMI `WmiMonitorID` 的 `ManufacturerName` + `UserFriendlyName`（EDID 解析结果），用 `EnumDisplayDevices` 拿到的 PnPId 与 `InstanceName` 匹配，对号入座。
-- 读取放在后台线程，先显示降级名（`通用外接显示器 N` / `内置显示屏`），读到后自动替换并重绘，不阻塞面板打开。
-- 同名显示器自动加后缀 `(1)` `(2)`；胶囊超过 14 字符截断为 `…`，鼠标悬停显示完整名称。
-- 菜单项带状态：`(主显示器)`、`(副屏)`、`(内置)`；「全部显示器」带台数。
-
-## 混合控制的识别顺序
-
-1. `EnumDisplayMonitors` 逐台枚举，每台调用 `GetPhysicalMonitorsFromHMONITOR`，能读到 `GetMonitorBrightness` 的标记为 DDC/CI 可控屏。
-2. 再查 `ROOT\WMI` 的 `WmiMonitorBrightness`，有实例就追加一台「内置显示器」，读取当前百分比。
-3. 两台不同通路在 `Mon` 里只用 `dev` 区分：DDC 屏存 `\\.\DISPLAYn`，内置屏存 `WMI`，写入时按 `dev` 分流，上层（拖动、热键、全部同步）无感知。
-
-## 目录
-
-```
-src/lumen.cpp        全部实现
-lumen.rc             图标与版本资源
-build.bat            一键构建
-tools/               回归用开发工具（不参与主程序）
-  probe.cpp          枚举显示器与读写亮度
-  shot.cpp           抓屏
-  ui.cpp             驱动面板点击 / 失焦 / 热键
-  mclick.cpp         真实鼠标点击
-  key.cpp            发送组合键
-  wrect.cpp          打印窗口矩形
-  toggle.cpp         开关面板
-  closewnd.cpp       关闭面板
-  crop.cpp           从截图中裁剪面板区域
-  resmon.cpp         采样进程 CPU / 内存 / 句柄 / GDI+USER 对象
-  makeicon.cpp       生成 lumen.ico
-  dumpicon.cpp       提取 exe 图标
-```
+需要 MSYS2 MinGW-w64 工具链（`g++` + `windres` 加入 `PATH`）；可选代码签名：设置 `SIGN_PFX` / `SIGN_PFX_PASS` 环境变量后自动签名。
 
 ## 配置
 
-注册表 `HKCU\Software\lumen`：
+注册表 `HKCU\Software\lumen`，常用项：
 
 | 键 | 含义 |
 | --- | --- |
-| `Autostart` | 开机自启 |
-| `AutoBrightness` | 按时间自动调节 |
-| `AutoStartH` / `AutoEndH` | 自动调节的起止小时（默认 7 / 19） |
+| `SelMonitor` | 记住的显示器选择（`ALL` 或 PnPId） |
+| `Step` | 调节步长：1 / 2 / 5 / 10 |
+| `AutoBrightness` / `AutoStartH` / `AutoEndH` | 按时间自动调节与起止小时 |
+| `DayPct` / `NightPct` | 日 / 夜目标亮度 |
 | `DdcDelay` | DDC/CI 两次指令的最小间隔（ms） |
 | `ThemeMode` | 0 跟随系统 / 1 浅色 / 2 深色 |
-| `HotUpMod` / `HotUpVk` | 上调键 |
-| `HotDownMod` / `HotDownVk` | 下调键 |
-| `HotShowMod` / `HotShowVk` | 呼出面板键（默认 `Ctrl+Alt+B`） |
-| `SelMonitor` | 记住的显示器选择：`ALL` 或某台显示器的 PnPId（如 `TRG0000`） |
-| `Step` | 滚轮/快捷键的调节步长：1 / 2 / 5 / 10（默认 5） |
-| `DayPct` / `NightPct` | 日间 / 夜间目标亮度（默认 80 / 20） |
 | `Lang` | 0 跟随系统 / 1 中文 / 2 English |
-| `Last_<显示器键>` | 每台屏最后写入的亮度，用于唤醒/重启后恢复 |
-| `GammaDim` | 软件调光（HDR 显示器用）开关 |
-| `WheelTray` / `WheelPanel` | 托盘图标上 / 面板打开时的滚轮调节开关（默认 1） |
-| `KeyBright` | 键盘 HID 亮度键开关（默认 0，关闭） |
-| `WlMax` | 标定得到的 SDR 白电平上限（`0` = 未标定） |
-| `TrayX` / `TrayY` | 校准得到的托盘图标坐标，Raw Input 命中兜底 |
+| `FontPct` | 界面字体大小：90–110%（默认 100） |
+| `GammaDim` | 软件调光（HDR 显示器用） |
+| `KeyBright` | 键盘 HID 亮度键开关 |
+| `WheelTray` / `WheelPanel` | 托盘图标 / 面板打开时的滚轮调节开关 |
 
-开机自启写 `HKCU\...\CurrentVersion\Run` 的 `lumen` 项。
+其余记忆项（亮度 `Last_<屏>`、面板与 OSD 位置 `PanelX/Y` `OsdX/Y`、分组折叠 `SetFold`、单屏偏移 `Off_<屏>`、HDR 标定 `WlMax`、托盘图标坐标 `TrayX/Y` 等）由程序自动维护。
 
 ## 已知边界
 
-- 内置屏的 WMI 读取走 COM（几十毫秒），写入走系统自带 CIM 调用（约 0.5–1 秒），所以内置屏拖动有明显延迟，但合并后最终值一定写入。
-- 混合场景下「全部显示器」会同时写 DDC/CI 屏与内置屏，内置屏的慢写入会拖慢整轮，UI 不受影响。
-- **HDR 开/关切换后数秒内 DDC/CI 会短暂失联**（显示器固件行为，独立进程此时也读写失败）：写入线程带 4 秒看门狗 + 8 秒冷却自愈，期间面板仍正常记账，冷却结束后下一次调节自动恢复；不建议在切换 HDR 后立刻连续调亮度。
-- 显示器 OSD 里必须开启 DDC/CI，否则该屏不可控。
-- **HDR 模式**：外接屏固件会锁定 DDC/CI 亮度，lumen 写入成功但画面不变——此时启用托盘菜单「软件调光（HDR 显示器用）」，亮度改走 gamma 软件调光；`0–100%` 相对当前 Windows 白电平全段有效（`100%` = 恒等 LUT，当前最亮），压暗的是信号而非背光，观感与背光调节略有差异。
-- 「HDR」徽章只反映 **Windows 级 HDR**（显示事件 + 3 秒轮询）；显示器 OSD 菜单里的硬件 HDR 不改变 Windows 信号模式，无法被检测。HDR 激活时提示行显示「Windows 白电平」（设置里「SDR 内容亮度」滑条的实时镜像）与 lumen 调光比例——两者是相乘的两个轴，数值不互相覆盖。
-- **熄屏**：优先走 DDC/CI `VCP 0xD6`（先 4=Off soft、再 5=Off hard，写入后读回确认）；不少显示器固件不支持该寄存器，写命令会返回成功却不执行——此时自动降级为系统广播 `SC_MONITORPOWER`，代价是会把所有显示器一起关掉，且任何键鼠输入都会由系统点亮。熄屏后前 3 秒为防误触宽限期，期间任何输入都不算唤醒；3 秒后一有输入即对支持 DDC 的屏再发一次 `0xD6=1` 并回放熄屏前亮度。
-- **HDR 基准标定**：托盘菜单「标定 HDR 基准亮度」需要先把 Windows「SDR 内容亮度」滑条拉到最右再执行，读到的 SDRWL 才是上限；结果存 `WlMax`，超出 1500–20000 范围会被拒绝。`WlMax` 只作为提示行与诊断里的参考刻度（显示「当前白电平 / 标定最大白电平」），**不参与亮度换算**：lumen 百分比表示相对当前 Windows 白电平的调光比例，`100%` = 恒等 LUT（当前最亮），`0–100%` 全段有效。想更亮请调高 Windows 的「SDR 内容亮度」滑条。
-- **HDR 软件调光的两段式**：`10%` 是临界点。以上只调 gamma LUT，遮罩透明；以下 gamma 锁死在 10% 的基准值，剩余亮度由遮罩补足（最深透光 6%），两段在 10% 处连续、无跳变。LUT 写入后会读回校验，部分 HDR 驱动会忽略 `SetDeviceGammaRamp`——连续两次不符就判定为不可用，自动退到全区间遮罩（此时亮度和遮罩仍跟手，但 HDR 高光会被一起压暗）。退出或关闭软件调光时，会把启动前备份的原始 LUT 写回；被强杀后下次启动发现 LUT 明显偏暗会先归一。
-- 「按时间自动调节」按设置的两个时间点触发，渐变时长固定 8 分钟（落在 5–10 分钟区间内），不是真实日出日落，也没有地理位置，且不支持跨午夜区间（结束时间必须晚于开始时间）。
-- 设置页是主面板内的视图，**没有独立的设置窗口**（旧的 `LumenSetWnd` 已整体删除）；`Esc` 在设置页返回主面板、在主面板收起面板，也可以点左上「← 返回」（该区域已从窗口拖动区排除）。
-- 设置页内不响应轨道拖动与滚轮，避免改设置时误调亮度；离开设置页恢复。
+- 显示器 OSD 菜单里必须开启 DDC/CI，否则该屏不可控。
+- 内置屏 WMI 写入约 0.5–1 s，「全部显示器」同步会随之变慢，UI 不受影响。
+- HDR 开/关后数秒内 DDC/CI 短暂失联（固件行为）：程序带看门狗与冷却自愈，期间建议用「软件调光」。
+- 熄屏的 DDC 通路见上方 **KTC / MStar 警告**；固件不支持时自动降级 `SC_MONITORPOWER`（会把所有屏一起关掉）。
 - 程序以 `asInvoker` 运行；前台是管理员窗口时，全局热键受 UIPI 限制。
-- **退出清理带 3 秒看门狗**：退出时若清理段被驱动/DDC 阻塞，3 秒后强制终结进程——任何情况下都不会留下无窗口的「空线程进程」残留。
