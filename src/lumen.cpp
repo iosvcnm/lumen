@@ -48,7 +48,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_DIM     (WM_APP + 8)   // wParam = dev string (heap), lParam = 遮罩黑度 0-85
 #define WM_WLCAL   (WM_APP + 9)   // wParam = 标定得到的滑条最大白电平（0 = 失败）
 
-#define APP_VERSION L"1.4.0"
+#define APP_VERSION L"1.4.1"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
@@ -196,6 +196,7 @@ static int g_langPref = 0;   // 注册表原始偏好（0 未解析），g_lang 
 static int g_step = 5;       // 滚轮/热键步长，可调 1/2/5/10
 static int g_wheelTray = 1, g_wheelPanel = 1;   // 鼠标设置：托盘图标 / 打开面板时滚轮调节亮度
 static int g_keyBright = 0;                     // 键盘 HID 亮度键（Consumer 0x6F/0x70），默认关
+static int g_ddcOff = 0;                        // 精确熄屏（DDC 0xD6）开关，默认关——MStar 方案显示器有永久损坏 OSD 的已知固件缺陷（issue #6）
 static unsigned long long g_lastKeyTick = 0;    // 亮度键去抖（按住键 auto-repeat ~30/s）
 static int g_gammaDim = 0;   // 软件调光：HDR 固件锁 DDC 亮度时的 gamma 回退通路
 static std::atomic<float> g_baseL{1.f};   // 仅供提示/诊断：当前白电平 ÷ 标定最大值（1 = 未标定 / 滑条最右）
@@ -220,7 +221,7 @@ enum {
     S_CAL, S_CALDONE, S_CALFAIL, S_CALIB, S_CALIBHINT, S_CALDONE2,
     S_OFFPG, S_OFFHINT, S_OFFRESET,
     S_GENERAL, S_ABOUT, S_HOME, S_HOOKFAIL,
-    S_FOLL, S_FONTS,
+    S_FOLL, S_FONTS, S_DDCKILL, S_KILLWARN,
     S_COUNT
 };
 static const wchar_t* const STR_CN[S_COUNT] = {
@@ -244,6 +245,8 @@ static const wchar_t* const STR_CN[S_COUNT] = {
     L"单屏偏移", L"只影响「全部显示器」同步；单屏直接调节不偏移", L"全部归零",
     L"通用", L"关于", L"项目主页", L"键盘钩子安装失败：点击面板后仍可录入",
     L"跟随系统", L"字体大小",
+    L"精确熄屏（DDC 0xD6）",
+    L"该显示器为 KTC/MStar 方案，存在「熄屏后 OSD 永久失效」的已知固件缺陷（详见项目 README）。\n\n仍要使用 DDC 熄屏吗？选「否」将改用系统休眠，无此风险。",
 };
 static const wchar_t* const STR_EN[S_COUNT] = {
     L"Brightness", L"Theme", L"Auto", L"Light", L"Dark",
@@ -268,6 +271,8 @@ static const wchar_t* const STR_EN[S_COUNT] = {
     L"Reset all",
     L"General", L"About", L"Project page", L"Keyboard hook failed: click the panel first to record",
     L"Follow system", L"Font size",
+    L"Precise screen off (DDC 0xD6)",
+    L"This monitor (KTC/MStar scaler) has a known firmware defect: screen-off via DDC can permanently break the OSD (see the project README).\n\nStill use DDC screen-off? Choose No to use the system display sleep instead (no risk).",
 };
 static const wchar_t* tr(int id) { return (g_lang == 2) ? STR_EN[id] : STR_CN[id]; }
 static int RegGet(const wchar_t* name, int def);   // 定义在配置区，ApplyLang 先用
@@ -349,6 +354,7 @@ static void LoadConfig() {
     g_wheelTray  = RegGet(L"WheelTray", 1) ? 1 : 0;
     g_wheelPanel = RegGet(L"WheelPanel", 1) ? 1 : 0;
     g_keyBright  = RegGet(L"KeyBright", 0) ? 1 : 0;
+    g_ddcOff     = RegGet(L"DdcScreenOff", 0) ? 1 : 0;
     g_setFold = RegGet(L"SetFold", 0) & 0xF;   // 分组折叠状态（bit0 通用 / bit1 快捷键 / bit2 鼠标 / bit3 关于）
     g_wlMax = RegGet(L"WlMax", 0);
     { int tx = RegGet(L"TrayX", -1), ty = RegGet(L"TrayY", -1);
@@ -1346,9 +1352,20 @@ static bool PowerOffDDC(const std::wstring& dev) {
 }
 
 // 关闭选中屏幕：
-// - 选中外接 DDC 屏 → 发送 VCP 0xD6=5
-// - 选中内置屏（WMI）或「全部显示器」→ DDC 屏逐一 0xD6=5，同时广播 SC_MONITORPOWER=2 兜底
+// - 默认走系统广播 SC_MONITORPOWER=2（Windows 待机同款 DPMS 通路，对显示器无风险）
+// - 设置页开启「精确熄屏（DDC 0xD6）」后才对 DDC 屏发 VCP 0xD6=5（可只关单屏；
+//   MStar 方案显示器存在 0xD6 永久写坏 OSD 的已知固件缺陷，命中厂商黑名单时先弹系统确认框）
 // 记录熄屏前亮度快照，待用户任意输入后恢复
+static const wchar_t* const kOsdUnsafeVendors[] = { L"SKG" };   // KTC（issue #6），持续收集于 issue
+
+static bool MonUnsafeOsd(const Mon& m) {
+    if (m.key.rfind(L"MONITOR\\", 0) != 0) return false;
+    size_t vs = wcslen(L"MONITOR\\");
+    for (auto& v : kOsdUnsafeVendors)
+        if (_wcsnicmp(m.key.c_str() + vs, v, 3) == 0) return true;
+    return false;
+}
+
 static void TurnOffSelectedScreen() {
     if (g_screenOff || g_restoring) return;
     g_offDevs.clear();
@@ -1365,17 +1382,17 @@ static void TurnOffSelectedScreen() {
 
     if (g_sel >= 0 && g_sel < (int)g_mons.size()) {
         const Mon& m = g_mons[g_sel];
-        if (m.dev != L"WMI") {
+        if (m.dev != L"WMI" && g_ddcOff) {
             g_offDevs.push_back(m.dev);
             g_offSaved.push_back(snapFor(m));
         } else {
-            g_offAll = true;   // 内置屏无 DDC 通道，走系统广播
+            g_offAll = true;   // 内置屏无 DDC 通道 / 未开精确熄屏 → 系统广播
         }
         RegPut((L"Last_" + m.key).c_str(), m.pct);
     } else {
         for (auto& m : g_mons) {
             if (!m.controllable) continue;
-            if (m.dev != L"WMI") {
+            if (m.dev != L"WMI" && g_ddcOff) {
                 g_offDevs.push_back(m.dev);
                 g_offSaved.push_back(snapFor(m));
             } else {
@@ -1384,6 +1401,22 @@ static void TurnOffSelectedScreen() {
             RegPut((L"Last_" + m.key).c_str(), m.pct);
         }
         g_offAll = true;   // 「全部显示器」一律广播覆盖未被 DDC 覆盖的屏
+    }
+
+    // DDC 熄屏 + 黑名单厂商（KTC 等 MStar 方案）：系统确认框，默认「否」；取消即整体改走系统广播
+    if (!g_offDevs.empty()) {
+        bool unsafe = false;
+        for (auto& m : g_mons)
+            if (m.dev != L"WMI" && MonUnsafeOsd(m)) { unsafe = true; break; }
+        if (unsafe) {
+            int mb = MessageBoxW(HWND_TOPMOST, tr(S_KILLWARN), L"lumen",
+                                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND);
+            if (mb != IDYES) {
+                g_offDevs.clear();
+                g_offSaved.clear();
+                g_offAll = true;
+            }
+        }
     }
 
     if (g_offDevs.empty() && !g_offAll) return;
@@ -2558,7 +2591,7 @@ struct SetLay {
 
 static SetLay g_setLay;
 static void RefreshSetLayout() {
-    static const float bodyH[4] = { 9 * SET_ROW, 3 * SET_HKROW, 4 * SET_ROW, 2 * SET_ROW };
+    static const float bodyH[4] = { 10 * SET_ROW, 3 * SET_HKROW, 4 * SET_ROW, 2 * SET_ROW };
     float y = 104.f;                       // 首组标题（页首分隔线 y=96 下方）
     for (int i = 0; i < 4; ++i) {
         if (i > 0) y += 8.f;               // 组间距（容纳上方分隔线）
@@ -2825,6 +2858,10 @@ static void DrawSettingsContent(Graphics& g, int W, int H) {
 
         // 第 9 行：标定 HDR 基准亮度（整行点击，气泡报结果）
         g.DrawString(tr(S_CAL), -1, &fl, PointF(SET_L, SetRowY(8)), &tb);
+
+        // 第 10 行：精确熄屏（DDC 0xD6），默认关——MStar 方案显示器有永久损坏 OSD 的已知固件缺陷
+        g.DrawString(tr(S_DDCKILL), -1, &fl, PointF(SET_L, SetRowY(9)), &tb);
+        ToggleTrack(g, SetToggleRect(9).X, SetToggleRect(9).Y, g_ddcOff != 0, g_dark);
     }
 
     if (g_setFold & 2) {   // 全局快捷键
@@ -3450,6 +3487,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (InRect(SetCalWLRect(), x, sy)) {         // 标定 HDR 基准亮度（自托盘迁入）
                     DoCalWL();
+                    return 0;
+                }
+                if (InRect(SetToggleRect(9), x, sy)) {       // 精确熄屏（DDC 0xD6）
+                    g_ddcOff = g_ddcOff ? 0 : 1;
+                    RegPut(L"DdcScreenOff", g_ddcOff);
+                    InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
             }                                    // 通用组折叠时以上全部失效

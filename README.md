@@ -20,7 +20,7 @@ Download `lumen.exe` from [Releases](https://github.com/iosvcnm/lumen/releases/l
 - 「全部显示器」同步 + 单屏偏移校准（多屏观感对齐）
 - HDR 兼容：感知 Windows SDR 白电平，gamma 软件调光兜底（LUT 读回校验、自动降级）
 - 按时间自动调节：日/夜目标亮度，切换时 5 秒平滑过渡
-- 熄屏：DDC `0xD6` 电源命令，固件不支持时自动降级 `SC_MONITORPOWER` —— **MStar 方案显示器请先看下方警告**
+- 熄屏：默认系统休眠（`SC_MONITORPOWER`，对显示器无风险）；设置页「精确熄屏（DDC 0xD6）」开启后可只关单屏 —— **MStar 方案显示器请先看下方警告**
 - 调节方式：面板旋钮、托盘/面板滚轮、全局快捷键、键盘亮度键（HID）
 - 设置页：折叠分组 + 页内滚动、中英双语、字体大小 90–110%、软件调光 / 标定 / 校准 / 诊断集中管理
 - 记忆：显示器选择、面板与 OSD 位置、每台屏亮度、分组折叠
@@ -67,6 +67,7 @@ build.bat
 | `Lang` | 0 跟随系统 / 1 中文 / 2 English |
 | `FontPct` | 界面字体大小：90–110%（默认 100） |
 | `GammaDim` | 软件调光（HDR 显示器用） |
+| `DdcScreenOff` | 精确熄屏（DDC 0xD6）开关，默认 0；开启后熄屏走 DDC，命中 MStar 黑名单会弹确认框 |
 | `KeyBright` | 键盘 HID 亮度键开关 |
 | `WheelTray` / `WheelPanel` | 托盘图标 / 面板打开时的滚轮调节开关 |
 
@@ -77,5 +78,5 @@ build.bat
 - 显示器 OSD 菜单里必须开启 DDC/CI，否则该屏不可控。
 - 内置屏 WMI 写入约 0.5–1 s，「全部显示器」同步会随之变慢，UI 不受影响。
 - HDR 开/关后数秒内 DDC/CI 短暂失联（固件行为）：程序带看门狗与冷却自愈，期间建议用「软件调光」。
-- 熄屏的 DDC 通路见上方 **KTC / MStar 警告**；固件不支持时自动降级 `SC_MONITORPOWER`（会把所有屏一起关掉）。
+- 熄屏默认走系统休眠（对显示器无风险）；「精确熄屏（DDC 0xD6）」开启后见上方 **KTC / MStar 警告**，命中黑名单厂商（KTC 等）时每次弹系统确认框。
 - 程序以 `asInvoker` 运行；前台是管理员窗口时，全局热键受 UIPI 限制。
