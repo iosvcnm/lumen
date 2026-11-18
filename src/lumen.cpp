@@ -51,7 +51,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_WLCAL   (WM_APP + 9)   // wParam = 标定得到的滑条最大白电平（0 = 失败）
 #define WM_BADGEOPEN (WM_APP + 10)  // 双击任务栏贴片：打开主面板（低级鼠标钩子投递）
 
-#define APP_VERSION L"1.4.1"
+#define APP_VERSION L"1.4.3"
 
 #define HK_UP     9001
 #define HK_DOWN   9002
