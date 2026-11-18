@@ -38,6 +38,8 @@ static const wchar_t* kMsgClass   = L"LumenMsgWnd";
 static const wchar_t* kBcastClass = L"LumenBcastWnd";   // 顶层隐藏：接收系统广播转发给 g_msg
 static const wchar_t* kPanelClass = L"LumenPanelWnd";
 static const wchar_t* kOsdClass   = L"LumenOsdWnd";
+static const wchar_t* kBadgeClass = L"LumenBadgeWnd";       // 任务栏日/夜贴片（无底框图标）
+static const wchar_t* kBadgeInfoClass = L"LumenBadgeInfoWnd"; // 悬停读数（名称 + 数值，无底框）
 static const wchar_t* kCfgKey     = L"Software\\lumen";
 
 #define WM_TRAY   (WM_APP + 1)
@@ -47,6 +49,7 @@ static const wchar_t* kCfgKey     = L"Software\\lumen";
 #define WM_UPDATE  (WM_APP + 7)   // wParam = new tag string (heap, receiver frees)
 #define WM_DIM     (WM_APP + 8)   // wParam = dev string (heap), lParam = 遮罩黑度 0-85
 #define WM_WLCAL   (WM_APP + 9)   // wParam = 标定得到的滑条最大白电平（0 = 失败）
+#define WM_BADGEOPEN (WM_APP + 10)  // 双击任务栏贴片：打开主面板（低级鼠标钩子投递）
 
 #define APP_VERSION L"1.4.1"
 
@@ -208,6 +211,28 @@ static POINT g_iconPt{};                    // 托盘图标实时位置（悬停
 static bool g_iconHover = false;            // 是否已获得图标位置（获得后滚轮判定收窄到图标邻域）
 static bool g_calibrating = false;          // 校准中：下一次托盘左键点击记录图标位置
 static int g_wlMax = 0;                   // 标定的滑条最大白电平（0 = 未标定）
+
+// ---- 任务栏数值贴片（可选）：无底框；静止=日/夜小图标，悬停上方=设备名+数值 ----
+static int  g_cfgBadge = 0;               // 注册表 TaskbarBadge，默认关
+static HWND g_badge = nullptr;            // 图标窗口（ULW 逐像素透明）
+static HWND g_badgeInfo = nullptr;        // 悬停读数窗口（同样无底框）
+static int  g_badgeDpi = 96;
+static bool g_badgeShown = false;
+static bool g_badgeHovered = false;       // 指针在图标上：显示任务栏同款选中框
+static bool g_badgeInfoShown = false;
+static int  g_badgeDrawnPhase = -1;       // 0 夜 / 1 日；-1 未绘制
+static bool g_badgeDrawnDark = false;
+static std::wstring g_badgeInfoKey;       // 已绘制的悬停文本键（名称+数值+亮暗）
+static RECT g_badgeRect{};                // 图标屏幕矩形（悬停读数定位用）
+static RECT g_badgeTaskbarRect{};         // 任务栏当前矩形（读数放在任务栏外，避免被任务栏压住）
+static int  g_badgeEdge = 3;              // 0 左 / 1 上 / 2 右 / 3 下
+static DWORD g_badgeSlowTick = 0;         // 500ms 慢项（主题/设备名/读数文本）上次检查
+static DWORD g_badgeHoverSince = 0;       // 指针进入图标的时间（0=不在图标上；悬停靠轮询，不依赖命中）
+static DWORD g_badgeLastClick = 0;        // 双击判定：上一次按下的时间/位置
+static POINT g_badgeLastClickPt{};
+static const int BADGE_WL = 36;           // 96 DPI 逻辑尺寸（悬停选中框 + 图标）
+static const int BADGE_HL = 30;
+
 enum {
     S_BRIGHTNESS, S_THEME, S_AUTO, S_LIGHT, S_DARK,
     S_ALLMON, S_NOCTRL, S_ALLMONFMT, S_BUILTIN, S_PRIMARY, S_EXTERNAL, S_NOADJ,
@@ -222,6 +247,7 @@ enum {
     S_OFFPG, S_OFFHINT, S_OFFRESET,
     S_GENERAL, S_ABOUT, S_HOME, S_HOOKFAIL,
     S_FOLL, S_FONTS, S_DDCKILL, S_KILLWARN,
+    S_BADGE,
     S_COUNT
 };
 static const wchar_t* const STR_CN[S_COUNT] = {
@@ -247,6 +273,7 @@ static const wchar_t* const STR_CN[S_COUNT] = {
     L"跟随系统", L"字体大小",
     L"精确熄屏（DDC 0xD6）",
     L"该显示器为 KTC/MStar 方案，存在「熄屏后 OSD 永久失效」的已知固件缺陷（详见项目 README）。\n\n仍要使用 DDC 熄屏吗？选「否」将改用系统休眠，无此风险。",
+    L"任务栏数值贴片",
 };
 static const wchar_t* const STR_EN[S_COUNT] = {
     L"Brightness", L"Theme", L"Auto", L"Light", L"Dark",
@@ -273,6 +300,7 @@ static const wchar_t* const STR_EN[S_COUNT] = {
     L"Follow system", L"Font size",
     L"Precise screen off (DDC 0xD6)",
     L"This monitor (KTC/MStar scaler) has a known firmware defect: screen-off via DDC can permanently break the OSD (see the project README).\n\nStill use DDC screen-off? Choose No to use the system display sleep instead (no risk).",
+    L"Taskbar readout",
 };
 static const wchar_t* tr(int id) { return (g_lang == 2) ? STR_EN[id] : STR_CN[id]; }
 static int RegGet(const wchar_t* name, int def);   // 定义在配置区，ApplyLang 先用
@@ -289,6 +317,8 @@ static void ApplyLang() {
 }
 
 static void AddTray();
+static void BadgeInvalidate();      // 贴片重绘（Post/主题变化时调用；窗口未创建时无操作）
+static void BadgeApplyEnabled();    // 开关打开/关闭时创建或销毁贴片（设置页调用）
 
 // ---------------------------------------------------------------- 配置
 
@@ -355,6 +385,7 @@ static void LoadConfig() {
     g_wheelPanel = RegGet(L"WheelPanel", 1) ? 1 : 0;
     g_keyBright  = RegGet(L"KeyBright", 0) ? 1 : 0;
     g_ddcOff     = RegGet(L"DdcScreenOff", 0) ? 1 : 0;
+    g_cfgBadge   = RegGet(L"TaskbarBadge", 0) ? 1 : 0;
     g_setFold = RegGet(L"SetFold", 0) & 0xF;   // 分组折叠状态（bit0 通用 / bit1 快捷键 / bit2 鼠标 / bit3 关于）
     g_wlMax = RegGet(L"WlMax", 0);
     { int tx = RegGet(L"TrayX", -1), ty = RegGet(L"TrayY", -1);
@@ -633,6 +664,7 @@ static void LoadTheme() {
         g_pal.disc      = Color(255, 238, 243, 249);
         g_pal.discSh    = Color(255, 200, 211, 226);
     }
+    BadgeInvalidate();                       // 贴片读数颜色跟随任务栏亮暗（任务栏主题独立于应用主题）
 }
 
 // ---------------------------------------------------------------- 显示器
@@ -1741,6 +1773,7 @@ static void Post(int pct) {
             }
     g_writer.Post(std::move(dp));   // 注意：dp 已被 move，记账必须放在这之前
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+    BadgeInvalidate();              // 贴片读数与面板同源，任何亮度变化立即跟上
 }
 
 static void Adjust(int delta) {
@@ -1780,9 +1813,9 @@ static void CopyDiagnostics() {
     if (g_mons.empty()) g_mons = Scan();
     std::wstring t = std::wstring(L"lumen ") + APP_VERSION;
     wchar_t b[320];
-    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d gamma=%d wheel=%d/%d key=%d hookFail=%d",
+    swprintf(b, 320, L"\r\nlang=%d theme=%d step=%d ddc=%d auto=%d(%d-%d) autostart=%d gamma=%d wheel=%d/%d key=%d badge=%d hookFail=%d",
              g_lang, g_cfgTheme, g_step, g_cfgDelay, g_cfgAuto, g_cfgStartH, g_cfgEndH,
-             g_cfgStart, g_gammaDim, g_wheelTray, g_wheelPanel, g_keyBright, g_hookDead ? 1 : 0);
+             g_cfgStart, g_gammaDim, g_wheelTray, g_wheelPanel, g_keyBright, g_cfgBadge, g_hookDead ? 1 : 0);
     t += b;
     swprintf(b, 320, L"\r\nhotkeys: up=%ls down=%ls show=%ls",
              HotkeyText(g_hkUpMod, g_hkUpVk).c_str(),
@@ -2591,7 +2624,7 @@ struct SetLay {
 
 static SetLay g_setLay;
 static void RefreshSetLayout() {
-    static const float bodyH[4] = { 10 * SET_ROW, 3 * SET_HKROW, 4 * SET_ROW, 2 * SET_ROW };
+    static const float bodyH[4] = { 11 * SET_ROW, 3 * SET_HKROW, 4 * SET_ROW, 2 * SET_ROW };
     float y = 104.f;                       // 首组标题（页首分隔线 y=96 下方）
     for (int i = 0; i < 4; ++i) {
         if (i > 0) y += 8.f;               // 组间距（容纳上方分隔线）
@@ -2862,6 +2895,10 @@ static void DrawSettingsContent(Graphics& g, int W, int H) {
         // 第 10 行：精确熄屏（DDC 0xD6），默认关——MStar 方案显示器有永久损坏 OSD 的已知固件缺陷
         g.DrawString(tr(S_DDCKILL), -1, &fl, PointF(SET_L, SetRowY(9)), &tb);
         ToggleTrack(g, SetToggleRect(9).X, SetToggleRect(9).Y, g_ddcOff != 0, g_dark);
+
+        // 第 11 行：任务栏数值贴片（可选）：无底框日/夜图标（跟随浅/深主题）、悬停名称+数值、滚轮调节、双击开面板
+        g.DrawString(tr(S_BADGE), -1, &fl, PointF(SET_L, SetRowY(10)), &tb);
+        ToggleTrack(g, SetToggleRect(10).X, SetToggleRect(10).Y, g_cfgBadge != 0, g_dark);
     }
 
     if (g_setFold & 2) {   // 全局快捷键
@@ -3111,6 +3148,7 @@ static void ApplyMonitorSel(int idx) {
         g_cfgSel = L"ALL";
     }
     RegPutStr(L"SelMonitor", g_cfgSel);
+    BadgeInvalidate();              // 贴片数值/悬停设备名跟随当前选择
 }
 
 // 按上次的键重新对上号；找不到就退回「全部显示器」（不动已存的键，插回后还能恢复）
@@ -3495,6 +3533,13 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
+                if (InRect(SetToggleRect(10), x, sy)) {      // 任务栏数值贴片（可选）
+                    g_cfgBadge = g_cfgBadge ? 0 : 1;
+                    RegPut(L"TaskbarBadge", g_cfgBadge);
+                    BadgeApplyEnabled();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
             }                                    // 通用组折叠时以上全部失效
             if (g_setFold & 4) {                 // 鼠标与键盘
                 if (InRect(SetCalWheelRect(), x, sy)) {  // 校准滚轮图标位置（自托盘迁入）
@@ -3569,13 +3614,13 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_MOUSEWHEEL: {
-        if (g_page >= 1) {                   // 子页：滚轮滚动页内内容，每档 ±52 逻辑 px（缓动到位）
+        if (g_page >= 1) {                   // 子页：滚轮滚动页内内容，每档 ±104 逻辑 px（缓动到位）
             if (!g_scrollDrag) {
                 int d = GET_WHEEL_DELTA_WPARAM(wp);
                 if (d) {
                     int notches = d / WHEEL_DELTA;
                     if (!notches) notches = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）也走一行
-                    ScrollTo(g_subScroll - notches * 52);
+                    ScrollTo(g_subScroll - notches * 104);   // 每档 104 逻辑 px（原 52，滚一格太慢）
                 }
             }
             return 0;
@@ -3863,6 +3908,514 @@ static void ShowMenu() {
     else if (cmd == ID_EXIT) PostMessageW(g_msg, WM_CLOSE, 0, 0);
 }
 
+// ---------------------------------------------------------------- 任务栏数值贴片
+// 静止时在托盘左侧画一枚日/夜状态小图标（浅色主题=太阳，深色主题=月亮），无底框；
+// 悬停时图标出现托盘同款选中框，220ms 后在图标上方显示带圆角框的「设备名 + 当前亮度」。
+// 滚轮调节（WM_INPUT，不依赖焦点），双击打开主面板。任务栏自动隐藏时贴片一起消失。
+
+// 任务栏亮暗跟的是「Windows 模式」而不是应用自己的主题覆盖（SystemUsesLightTheme）
+static bool TaskbarIsDark() {
+    DWORD v = 1, n = sizeof(v), t = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            L"SystemUsesLightTheme", RRF_RT_REG_DWORD, &t, &v, &n) == ERROR_SUCCESS)
+        return v == 0;
+    return g_dark;
+}
+
+static std::wstring BadgeMonitorName() {
+    if (g_mons.empty()) return tr(S_NOCTRL);
+    if (g_sel >= 0 && g_sel < (int)g_mons.size()) return g_mons[g_sel].name;
+    wchar_t b[64];
+    swprintf(b, 64, tr(S_ALLMONFMT), (int)g_mons.size());
+    return b;
+}
+
+// 贴片读数与「选中屏」一致（启动时 g_val 是全部屏均值，面板打开后才对齐选中屏）
+static int BadgeValue() {
+    if (g_sel >= 0 && g_sel < (int)g_mons.size()) return g_mons[g_sel].pct;
+    return g_val;
+}
+
+// 图标跟随 lumen 的浅色/深色主题（ThemeMode），颜色再按任务栏亮暗做对比补偿
+static Color BadgeAccent() {
+    bool tdark = TaskbarIsDark();
+    if (g_dark)                                            // 夜间：月亮（琥珀）
+        return tdark ? Color(255, 236, 190, 118) : Color(255, 170, 114, 46);
+    return tdark ? Color(255, 174, 198, 228) : Color(255, 62, 92, 132);   // 日间：太阳（蓝）
+}
+
+static Color BadgeTextColor() {
+    return TaskbarIsDark() ? Color(255, 236, 242, 251) : Color(255, 38, 54, 76);
+}
+
+// 公共 ULW 呈现：逐像素透明，没有底框；draw 在 96 DPI 逻辑坐标里绘制
+template <typename DrawFn>
+static bool PresentLayered(HWND hwnd, int w, int h, DrawFn draw) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;             // top-down，与 GDI+ 行序一致
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screen = GetDC(hwnd);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!mem || !dib) {
+        if (mem) DeleteDC(mem);
+        if (dib) DeleteObject(dib);
+        ReleaseDC(hwnd, screen);
+        return false;
+    }
+    HGDIOBJ old = SelectObject(mem, dib);
+    {
+        Bitmap canvas(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Graphics g(&canvas);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        g.ScaleTransform(g_badgeDpi / 96.0f, g_badgeDpi / 96.0f);
+        g.Clear(Color(0, 0, 0, 0));
+        draw(g);
+    }
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    POINT src{ 0, 0 };
+    SIZE size{ w, h };
+    BOOL ok = UpdateLayeredWindow(hwnd, screen, nullptr, &size, mem, &src, 0, &bf, ULW_ALPHA);
+    SelectObject(mem, old);
+    DeleteObject(dib);
+    DeleteDC(mem);
+    ReleaseDC(hwnd, screen);
+    return ok != FALSE;
+}
+
+static void BadgePresent(HWND hwnd) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    bool day = !g_dark;
+    bool dark = TaskbarIsDark();
+    Color c = BadgeAccent();
+    bool hovered = g_badgeHovered;
+    bool ok = PresentLayered(hwnd, w, h, [&](Graphics& g) {
+        float cx = BADGE_WL / 2.f, cy = BADGE_HL / 2.f;
+        if (hovered) {
+            // 任务栏托盘图标同款悬停选中框：圆角半透明亮块 + 极淡描边
+            const float bw = (float)BADGE_WL - 4.f, bh = (float)BADGE_HL - 4.f;
+            GraphicsPath shp;
+            RoundRect(shp, RectF(3.f, 4.f, bw, bh), 9.f);
+            SolidBrush shb(Color(30, 0, 0, 0));
+            g.FillPath(&shb, &shp);
+            GraphicsPath box;
+            RoundRect(box, RectF(2.f, 2.f, bw, bh), 9.f);
+            SolidBrush bg(dark ? Color(40, 255, 255, 255) : Color(70, 255, 255, 255));
+            g.FillPath(&bg, &box);
+            Pen edge(dark ? Color(40, 255, 255, 255) : Color(55, 120, 140, 165), 1.f);
+            g.DrawPath(&edge, &box);
+        }
+        if (day) DrawSun(g, cx, cy, 9.4f, c);
+        else     DrawMoon(g, cx, cy, 9.2f, c);
+    });
+    if (ok) {
+        g_badgeDrawnPhase = day ? 1 : 0;
+        g_badgeDrawnDark = dark;
+    }
+}
+
+// ---- 悬停读数（设备名 + 数值）：文字浮在图标上方，无底框，鼠标穿透 ----
+static void BadgeInfoLayout(int* wl, int* hl) {
+    // 同一字族/字号：GDI+ 的行居中对齐才能让名称与数值落在同一基线上
+    Font fn(L"Microsoft YaHei UI", 13.f, FontStyleRegular, UnitPixel);
+    Font fv(L"Microsoft YaHei UI", 13.f, FontStyleBold, UnitPixel);
+    Bitmap probe(1, 1, PixelFormat32bppPARGB);
+    Graphics mg(&probe);
+    std::wstring name = BadgeMonitorName();
+    wchar_t val[16];
+    swprintf(val, 16, L"%d%%", BadgeValue());
+    RectF rn{}, rv{};
+    mg.MeasureString(name.c_str(), -1, &fn, PointF(0, 0), &rn);
+    mg.MeasureString(val, -1, &fv, PointF(0, 0), &rv);
+    float nw = std::min(rn.Width, 320.f);        // 超长显示器名在图内省略
+    *wl = (int)ceilf(nw + 9.f + rv.Width) + 20;  // 左右各 10px 内边距（读数框）
+    *hl = 29;                                    // 上下各 3px
+}
+
+static void BadgeInfoHide() {
+    if (g_badgeInfo) ShowWindow(g_badgeInfo, SW_HIDE);
+    g_badgeInfoShown = false;
+    g_badgeInfoKey.clear();
+}
+
+static void BadgeInfoRefresh() {
+    if (!g_badgeInfo || !g_badgeShown) return;
+    int wl = 0, hl = 0;
+    BadgeInfoLayout(&wl, &hl);
+    float k = g_badgeDpi / 96.0f;
+    int w = (int)ceilf(wl * k), h = (int)ceilf(hl * k);
+    int margin = MulDiv(8, g_badgeDpi, 96);
+
+    HMONITOR hm = MonitorFromWindow(g_badge, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hm, &mi)) return;
+    RECT mon = mi.rcMonitor;
+    int x, y;
+    int gap = MulDiv(3, g_badgeDpi, 96);
+    if (g_badgeEdge == 1) {              // 顶部任务栏：放在任务栏下方（避免被任务栏压住）
+        x = g_badgeRect.right - w;
+        y = g_badgeTaskbarRect.bottom + gap;
+    } else if (g_badgeEdge == 0) {       // 左侧任务栏：任务栏右侧
+        x = g_badgeTaskbarRect.right + gap;
+        y = g_badgeRect.top + (g_badgeRect.bottom - g_badgeRect.top - h) / 2;
+    } else if (g_badgeEdge == 2) {       // 右侧任务栏：任务栏左侧
+        x = g_badgeTaskbarRect.left - w - gap;
+        y = g_badgeRect.top + (g_badgeRect.bottom - g_badgeRect.top - h) / 2;
+    } else {                             // 底部任务栏：任务栏上方
+        x = g_badgeRect.right - w;
+        y = g_badgeTaskbarRect.top - h - gap;
+    }
+    if (x < mon.left + margin) x = mon.left + margin;
+    if (x + w > mon.right - margin) x = mon.right - margin - w;
+    if (y < mon.top + margin) y = mon.top + margin;
+    if (y + h > mon.bottom - margin) y = mon.bottom - margin - h;
+
+    RECT cur{};
+    GetWindowRect(g_badgeInfo, &cur);
+    bool sizeChanged = cur.right - cur.left != w || cur.bottom - cur.top != h;
+    if (sizeChanged || cur.left != x || cur.top != y)
+        SetWindowPos(g_badgeInfo, HWND_TOPMOST, x, y, w, h,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    std::wstring key = BadgeMonitorName();
+    wchar_t val[16];
+    swprintf(val, 16, L"%d%%", BadgeValue());
+    key += L'\x1f';
+    key += val;
+    key += TaskbarIsDark() ? L'T' : L't';
+    key += g_dark ? L'D' : L'd';
+    if (sizeChanged || key != g_badgeInfoKey) {
+        g_badgeInfoKey = key;
+        InvalidateRect(g_badgeInfo, nullptr, FALSE);
+    }
+    ShowWindow(g_badgeInfo, SW_SHOWNOACTIVATE);
+    g_badgeInfoShown = true;
+}
+
+static bool BadgeInfoCreate() {
+    if (g_badgeInfo) return true;
+    g_badgeInfo = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        kBadgeInfoClass, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_inst, nullptr);
+    return g_badgeInfo != nullptr;
+}
+
+static void BadgeInfoShow() {
+    if (!g_badgeShown || !BadgeInfoCreate()) return;
+    g_badgeInfoShown = true;             // 先置位：Refresh 里才会触发重绘
+    BadgeInfoRefresh();
+}
+
+static void BadgeInfoPresent(HWND hwnd) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    std::wstring name = BadgeMonitorName();
+    wchar_t val[16];
+    swprintf(val, 16, L"%d%%", BadgeValue());
+    Font fn(L"Microsoft YaHei UI", 13.f, FontStyleRegular, UnitPixel);
+    Font fv(L"Microsoft YaHei UI", 13.f, FontStyleBold, UnitPixel);
+    Bitmap probe(1, 1, PixelFormat32bppPARGB);
+    Graphics mg(&probe);
+    RectF rn{}, rv{};
+    mg.MeasureString(name.c_str(), -1, &fn, PointF(0, 0), &rn);
+    mg.MeasureString(val, -1, &fv, PointF(0, 0), &rv);
+    float nw = std::min(rn.Width, 320.f);
+
+    PresentLayered(hwnd, w, h, [&](Graphics& g) {
+        // 读数选中框：圆角亮/暗块 + 细描边 + 极淡落影，和任务栏托盘悬停框同风格
+        float boxW = nw + 9.f + rv.Width + 20.f, boxH = 29.f;
+        bool dark = TaskbarIsDark();
+        GraphicsPath shp;
+        RoundRect(shp, RectF(1.f, 2.f, boxW - 2.f, boxH - 2.f), 10.f);
+        SolidBrush shb(Color(35, 0, 0, 0));
+        g.FillPath(&shb, &shp);
+        GraphicsPath box;
+        RoundRect(box, RectF(0.5f, 0.5f, boxW - 1.f, boxH - 1.f), 10.f);
+        SolidBrush bg(dark ? Color(160, 34, 46, 62) : Color(155, 250, 252, 255));
+        g.FillPath(&bg, &box);
+        Pen edge(dark ? Color(70, 100, 120, 150) : Color(75, 150, 168, 190), 1.f);
+        g.DrawPath(&edge, &box);
+
+        StringFormat lf;
+        lf.SetLineAlignment(StringAlignmentCenter);
+        lf.SetFormatFlags(StringFormatFlagsNoWrap);
+        lf.SetTrimming(StringTrimmingEllipsisCharacter);
+        RectF nr(10.f, 3.f, nw, 23.f);
+        RectF vr(10.f + nw + 9.f, 3.f, rv.Width, 23.f);
+        SolidBrush nb(BadgeTextColor());
+        SolidBrush vb(BadgeAccent());
+        g.DrawString(name.c_str(), -1, &fn, nr, &lf, &nb);
+        g.DrawString(val, -1, &fv, vr, &lf, &vb);
+    });
+}
+
+static LRESULT CALLBACK BadgeInfoProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        BadgeInfoPresent(hwnd);
+        return 0;
+    }
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK BadgeProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);      // ULW：WM_PAINT 只清无效区，内容由 BadgePresent 呈现
+        BadgePresent(hwnd);
+        return 0;
+    }
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    case WM_LBUTTONDOWN:          // 点击由低级鼠标钩子统一处理（任务栏可能盖在贴片上面）
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// 贴片是否还在任务栏上方（任务栏自己会升到 TOPMOST 最上层）
+static bool BadgeAbove(HWND a, HWND b) {
+    if (!a || !b) return true;
+    for (HWND w = GetWindow(a, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV))
+        if (w == b) return true;
+    return false;
+}
+
+static void BadgeInvalidate() {
+    if (g_badge) InvalidateRect(g_badge, nullptr, FALSE);
+    if (g_badgeInfoShown) BadgeInfoRefresh();
+}
+
+static void BadgeDestroy() {
+    if (g_badgeInfo) { DestroyWindow(g_badgeInfo); g_badgeInfo = nullptr; }
+    if (g_badge) { DestroyWindow(g_badge); g_badge = nullptr; }
+    g_badgeShown = false;
+    g_badgeHovered = false;
+    g_badgeInfoShown = false;
+    g_badgeDrawnPhase = -1;
+    g_badgeInfoKey.clear();
+    g_badgeRect = RECT{};
+    g_badgeTaskbarRect = RECT{};
+    g_badgeHoverSince = 0;
+    g_badgeLastClick = 0;
+}
+
+// 任务栏当前矩形 + DPI + 可见比例 + 所在屏幕；完全不可见时返回 false。
+// 自动隐藏动画期间任务栏逐帧移动，贴片按当前矩形跟手移动（不再等 60% 才一刀切）。
+static bool TaskbarRect(RECT* trOut, int* dpiOut, float* visFrac, RECT* monOut) {
+    HWND shell = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!shell || !IsWindowVisible(shell)) return false;
+    RECT tr{};
+    if (!GetWindowRect(shell, &tr)) return false;
+    HMONITOR hm = MonitorFromWindow(shell, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hm, &mi)) return false;
+    RECT vis{};
+    if (!IntersectRect(&vis, &tr, &mi.rcMonitor)) return false;
+    int tw = tr.right - tr.left, th = tr.bottom - tr.top;
+    if (tw <= 0 || th <= 0) return false;
+    bool vertical = tw < th;
+    int seen = vertical ? (vis.right - vis.left) : (vis.bottom - vis.top);
+    int total = vertical ? tw : th;
+    if (seen <= 0) return false;
+    *visFrac = (float)seen / (float)total;
+    int dpi = 96;
+    typedef UINT(WINAPI* PFN)(HWND);
+    static PFN fn = (PFN)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+    if (fn) {
+        UINT d = fn(shell);
+        if (d >= 96) dpi = (int)d;
+    }
+    *trOut = tr;
+    *dpiOut = dpi;
+    *monOut = mi.rcMonitor;
+    return true;
+}
+
+static bool BadgeCreate() {
+    if (g_badge) return true;
+    g_badge = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        kBadgeClass, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_inst, nullptr);
+    if (!g_badge) return false;
+    g_badgeDrawnPhase = -1;
+    return true;
+}
+
+static void BadgeHideNow() {
+    g_badgeHoverSince = 0;
+    g_badgeHovered = false;
+    g_badgeLastClick = 0;
+    BadgeInfoHide();
+    if (g_badge && g_badgeShown) {
+        ShowWindow(g_badge, SW_HIDE);
+        g_badgeShown = false;
+    }
+}
+
+static void BadgeMaintain() {
+    if (!g_cfgBadge) { BadgeDestroy(); return; }
+
+    RECT tr{}, mon{};
+    int dpi = 96;
+    float visFrac = 0.f;
+    if (!TaskbarRect(&tr, &dpi, &visFrac, &mon)) {   // 完全收起：贴片一起消失
+        BadgeHideNow();
+        return;
+    }
+    if (!BadgeCreate()) return;
+
+    bool redraw = !g_badgeShown || dpi != g_badgeDpi;
+    if (dpi != g_badgeDpi) {
+        g_badgeDpi = dpi;
+        g_badgeDrawnPhase = -1;
+        g_badgeInfoKey.clear();
+    }
+
+    int bw = MulDiv(BADGE_WL, dpi, 96);
+    int bh = MulDiv(BADGE_HL, dpi, 96);
+    int gap = MulDiv(10, dpi, 96);
+    int trW = tr.right - tr.left, trH = tr.bottom - tr.top;
+    bool vertical = trW < trH;
+    HWND shell = FindWindowW(L"Shell_TrayWnd", nullptr);
+    HWND tn = shell ? FindWindowExW(shell, nullptr, L"TrayNotifyWnd", nullptr) : nullptr;
+    RECT nr{};
+    bool hasTray = tn && GetWindowRect(tn, &nr);
+
+    int x, y;
+    if (!vertical) {                              // 横向任务栏：托盘区左侧
+        int anchor = hasTray ? (int)nr.left : tr.right - MulDiv(220, dpi, 96);
+        x = anchor - gap - bw;
+        y = tr.top + (trH - bh) / 2;
+        if (x < tr.left + gap / 2) x = tr.left + gap / 2;
+    } else {                                      // 纵向任务栏：托盘区上方
+        int anchor = hasTray ? (int)nr.top : tr.bottom - MulDiv(220, dpi, 96);
+        y = anchor - gap - bh;
+        x = tr.left + (trW - bw) / 2;
+        if (y < tr.top + gap / 2) y = tr.top + gap / 2;
+    }
+
+    RECT want{ x, y, x + bw, y + bh };
+    RECT isect{};
+    if (!IntersectRect(&isect, &want, &mon)) {       // 贴片已跟着任务栏滑出屏幕
+        BadgeHideNow();
+        return;
+    }
+
+    RECT cur{};
+    GetWindowRect(g_badge, &cur);
+    bool moved = cur.left != x || cur.top != y ||
+                 cur.right - cur.left != bw || cur.bottom - cur.top != bh;
+    bool wasShown = g_badgeShown;
+    if (moved) {
+        SetWindowPos(g_badge, HWND_TOPMOST, x, y, bw, bh,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (wasShown) g_badgeInfoKey.clear();
+    } else if (!g_badgeShown) {
+        SetWindowPos(g_badge, HWND_TOPMOST, x, y, bw, bh,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    g_badgeShown = true;
+    g_badgeRect = want;
+    g_badgeTaskbarRect = tr;
+
+    // 任务栏在哪条边：决定悬停读数显示在图标的上/下/左/右
+    g_badgeEdge = 3;
+    if (tr.top <= mon.top + 2)           g_badgeEdge = 1;
+    else if (tr.bottom >= mon.bottom - 2) g_badgeEdge = 3;
+    else if (tr.left <= mon.left + 2)     g_badgeEdge = 0;
+    else                                  g_badgeEdge = 2;
+
+    if (shell && !BadgeAbove(g_badge, shell))     // 任务栏/其他 TOPMOST 升上来后把贴片抬回最上
+        SetWindowPos(g_badge, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    // 任务栏开始收起时读数立即消失，避免盖在正在下滑的任务栏上
+    if (visFrac < 0.9f && g_badgeInfoShown) BadgeInfoHide();
+    if (g_badgeInfoShown && moved) BadgeInfoRefresh();
+
+    DWORD now = GetTickCount();
+
+    // 悬停读数用光标轮询：任务栏在前台时会盖住贴片的命中层，收不到 WM_MOUSEMOVE
+    POINT pt{};
+    GetCursorPos(&pt);
+    bool over = visFrac >= 0.9f && PtInRect(&g_badgeRect, pt);
+    if (over != g_badgeHovered) {
+        g_badgeHovered = over;
+        InvalidateRect(g_badge, nullptr, FALSE);   // 选中框立即出现/消失
+    }
+    if (over) {
+        if (!g_badgeHoverSince) g_badgeHoverSince = now ? now : 1;
+        if (!g_badgeInfoShown && now - g_badgeHoverSince >= 220) BadgeInfoShow();
+    } else {
+        g_badgeHoverSince = 0;
+        if (g_badgeInfoShown) BadgeInfoHide();
+    }
+
+    if (redraw) InvalidateRect(g_badge, nullptr, FALSE);
+
+    // 慢项（主题/设备名/数值兜底）限频 500ms；亮度变化走 BadgeInvalidate 即时刷新
+    if (now - g_badgeSlowTick >= 500) {
+        g_badgeSlowTick = now;
+        bool dark = TaskbarIsDark();
+        bool day = !g_dark;
+        if (dark != g_badgeDrawnDark || (day ? 1 : 0) != g_badgeDrawnPhase)
+            InvalidateRect(g_badge, nullptr, FALSE);
+        if (g_badgeInfoShown) BadgeInfoRefresh();
+    }
+
+    if (g_badgeInfoShown && shell && !BadgeAbove(g_badgeInfo, shell))
+        SetWindowPos(g_badgeInfo, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static bool BadgeHitTest(POINT pt) {
+    if (!g_badge || !g_cfgBadge || !g_badgeShown) return false;
+    RECT rc{};
+    if (!GetWindowRect(g_badge, &rc)) return false;
+    return PtInRect(&rc, pt) != FALSE;
+}
+
+static void BadgeApplyEnabled() {
+    if (!g_msg) return;
+    if (!g_cfgBadge) {
+        BadgeDestroy();
+        KillTimer(g_msg, 5);
+        return;
+    }
+    SetTimer(g_msg, 5, 16, nullptr);    // ~60Hz：任务栏自动隐藏动画每 ~31ms 走一步，贴片按同节奏跟随
+    BadgeMaintain();
+}
+
 // ---------------------------------------------------------------- 检查更新（启动后台静默查一次 GitHub Releases）
 
 // Mimosa 约束：仅 https；host 白名单；解析出的 IP 拒绝环回/私有/链路本地等保留地址
@@ -3999,6 +4552,31 @@ static DWORD WINAPI CalWLThread(LPVOID) {
 static HHOOK g_mouseLL = nullptr;
 
 static LRESULT CALLBACK MouseLL(int code, WPARAM wp, LPARAM lp) {
+    // 任务栏贴片：点击全部由钩子接管并吞掉。任务栏在前台时会盖住贴片的命中层，
+    // 钩子仍能拿到点击；双击打开面板，也避免任务栏抢前台/误触底下的任务按钮。
+    if (code == HC_ACTION && g_msg && (wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP)) {
+        auto* ms = (MOUSEHOOKSTRUCTEX*)lp;
+        bool inBadge = g_badgeShown && !g_calibrating && PtInRect(&g_badgeRect, ms->pt);
+        if (inBadge) {
+            if (wp == WM_LBUTTONDOWN) {
+                DWORD now = GetTickCount();
+                int tol = 8;
+                if (g_badgeLastClick &&
+                    now - g_badgeLastClick <= (DWORD)GetDoubleClickTime() &&
+                    abs(ms->pt.x - g_badgeLastClickPt.x) <= tol &&
+                    abs(ms->pt.y - g_badgeLastClickPt.y) <= tol) {
+                    g_badgeLastClick = 0;
+                    g_badgeHoverSince = 0;
+                    PostMessageW(g_msg, WM_BADGEOPEN, 0, 0);
+                } else {
+                    g_badgeLastClick = now;
+                    g_badgeLastClickPt = ms->pt;
+                }
+            }
+            return 1;
+        }
+        if (wp == WM_LBUTTONDOWN) g_badgeLastClick = 0;   // 在贴片外按下：打断双击序列
+    }
     // 校准模式：点击任务栏托盘区内的 lumen 图标 → 记录光标位置为滚轮热区中心
     if (code == HC_ACTION && g_calibrating && g_msg &&
         (wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP)) {
@@ -4115,20 +4693,28 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const RAWINPUT* ri = (const RAWINPUT*)buf;
             if (ri->header.dwType == RIM_TYPEMOUSE && (ri->data.mouse.usButtonFlags & RI_MOUSE_WHEEL)) {
                 short d = (short)ri->data.mouse.usButtonData;
-                if (d && g_wheelTray) {
-                    RECT rc{};
+                if (d) {
                     POINT pt;
                     GetCursorPos(&pt);
-                    bool hit = IconRect(&rc) &&
-                               pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
-                    if (!hit && g_iconHover)          // 图标矩形取不到时，退回校准位置 ±20/±26
-                        hit = abs(pt.x - g_iconPt.x) <= 20 && abs(pt.y - g_iconPt.y) <= 26;
-                    if (hit) {
-                        // 按实际格数即时生效：快速滚动时数值跟手，写入频率由 Writer 合并
+                    if (BadgeHitTest(pt)) {
+                        // 贴片悬停滚轮：读数就在眼前，不再弹 OSD；按实际格数即时生效
                         int steps = (d / WHEEL_DELTA) * g_step;
                         if (!steps) steps = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）
-                        Post(g_val + steps);
-                        ShowOsd();
+                        Adjust(steps);                       // 按当前选中屏的实时值加减
+                        BadgeInfoShow();                     // 滚动时把「名称 + 新数值」亮出来
+                    } else if (g_wheelTray) {
+                        RECT rc{};
+                        bool hit = IconRect(&rc) &&
+                                   pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
+                        if (!hit && g_iconHover)          // 图标矩形取不到时，退回校准位置 ±20/±26
+                            hit = abs(pt.x - g_iconPt.x) <= 20 && abs(pt.y - g_iconPt.y) <= 26;
+                        if (hit) {
+                            // 按实际格数即时生效：快速滚动时数值跟手，写入频率由 Writer 合并
+                            int steps = (d / WHEEL_DELTA) * g_step;
+                            if (!steps) steps = d > 0 ? 1 : -1;   // 高精度滚轮（delta < 120）
+                            Post(g_val + steps);
+                            ShowOsd();
+                        }
                     }
                 }
             } else if (ri->header.dwType == RIM_TYPEHID && g_keyBright) {
@@ -4158,6 +4744,12 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == HK_UP) { Adjust(g_step); ShowOsd(); }
         else if (wp == HK_DOWN) { Adjust(-g_step); ShowOsd(); }
         else if (wp == HK_TOGGLE) TogglePanel();
+        return 0;
+
+    case WM_BADGEOPEN:                    // 双击任务栏贴片
+        BadgeInfoHide();
+        g_badgeHoverSince = 0;
+        ShowPanel();
         return 0;
 
     case WM_SHOW:
@@ -4218,6 +4810,7 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 2) ApplyAutoBrightness();
         if (wp == 7) AutoRampTick();
         if (wp == 8) ScrollAnimTick();
+        if (wp == 5) BadgeMaintain();            // 任务栏贴片：位置/显隐/DPI/主题/设备名同步
         if (wp == 4 && RefreshHdrFlags(g_mons) && g_hwnd)
             InvalidateRect(g_hwnd, nullptr, FALSE);   // HDR 开/关 → 徽章自动出现/消失
         return 0;
@@ -4271,6 +4864,8 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_offSaved.clear();
         }
         if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+        KillTimer(g_msg, 5);
+        BadgeDestroy();
         RemoveTray();
         PostQuitMessage(0);
         return 0;
@@ -4289,8 +4884,10 @@ static void RegisterClasses() {
     // 广播转发窗口：message-only 收不到系统广播，用顶层隐藏窗口转发给 g_msg
     WNDCLASSW bc{};
     bc.lpfnWndProc = [](HWND h, UINT m, WPARAM wp, LPARAM lp) -> LRESULT {
-        if (m == WM_DISPLAYCHANGE || m == WM_POWERBROADCAST) {
-            if (g_msg) PostMessageW(g_msg, m, wp, lp);
+        if (m == WM_DISPLAYCHANGE || m == WM_POWERBROADCAST || m == WM_SETTINGCHANGE) {
+            // message-only 窗口收不到广播：主题/DPI 变化也经这里转给主消息窗口。
+            // WM_SETTINGCHANGE 的 lParam 可能是系统地址空间里的字符串，转发时清空避免误读。
+            if (g_msg) PostMessageW(g_msg, m, wp, m == WM_SETTINGCHANGE ? 0 : lp);
             return 0;
         }
         return DefWindowProcW(h, m, wp, lp);
@@ -4301,6 +4898,18 @@ static void RegisterClasses() {
 
     c.lpfnWndProc = PanelProc;
     c.lpszClassName = kPanelClass;
+    c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&c);
+
+    c.lpfnWndProc = BadgeProc;                  // 任务栏贴片：双击靠 CS_DBLCLKS 生成 WM_LBUTTONDBLCLK
+    c.lpszClassName = kBadgeClass;
+    c.hCursor = LoadCursorW(nullptr, IDC_HAND);
+    c.style = CS_DBLCLKS;
+    RegisterClassExW(&c);
+    c.style = 0;
+
+    c.lpfnWndProc = BadgeInfoProc;              // 悬停读数：无底框文字，鼠标穿透
+    c.lpszClassName = kBadgeInfoClass;
     c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&c);
 
@@ -4402,6 +5011,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     ApplyNames(g_mons);
     RestoreBrightness();          // 重启后恢复每台屏的上次亮度
     ApplyAutoBrightness();
+    BadgeApplyEnabled();          // 任务栏数值贴片（可选，默认关；跟任务栏显隐）
     CloseHandle(CreateThread(nullptr, 0, CheckUpdateTh, nullptr, 0, nullptr));
 
     // --show：启动后直接展开面板；--settings：直接进设置页；--diag：复制诊断信息后退出
