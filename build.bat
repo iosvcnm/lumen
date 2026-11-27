@@ -1,6 +1,7 @@
 @echo off
 setlocal
 set ROOT=%~dp0
+cd /d "%ROOT%"
 rem Requires MinGW-w64 g++ and windres on PATH. Set PATH before calling this script.
 
 if not exist "%ROOT%tools\makeicon.exe" (

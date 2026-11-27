@@ -1,8 +1,11 @@
+#define IDR_DIAL_LIGHT 201
+#define IDR_DIAL_DARK  202
+
 1 ICON "lumen.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,4,3,0
-PRODUCTVERSION 1,4,3,0
+FILEVERSION 1,5,0,0
+PRODUCTVERSION 1,5,0,0
 FILEOS 0x40004L
 FILETYPE 0x1L
 BEGIN
@@ -12,7 +15,7 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "lumen"
       VALUE "ProductName", "lumen"
-      VALUE "FileVersion", "1.4.3"
+      VALUE "FileVersion", "1.5.0"
       VALUE "OriginalFilename", "lumen.exe"
       VALUE "LegalCopyright", "MIT"
     END
@@ -22,3 +25,7 @@ BEGIN
     VALUE "Translation", 0x804, 1200
   END
 END
+
+// 预烘焙 3D 旋钮底图（静态层，运行时按 DPI 缩放）
+IDR_DIAL_LIGHT RCDATA "assets/dial_light.png"
+IDR_DIAL_DARK  RCDATA "assets/dial_dark.png"
